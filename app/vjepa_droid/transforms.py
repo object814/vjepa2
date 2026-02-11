@@ -22,6 +22,9 @@ def make_transforms(
     crop_size=224,
     normalize=((0.485, 0.456, 0.406), (0.229, 0.224, 0.225)),
 ):
+    """
+    Create a video transform pipeline with the given parameters on the input video frames.
+    """
 
     _frames_augmentation = VideoTransform(
         random_horizontal_flip=random_horizontal_flip,
@@ -37,6 +40,14 @@ def make_transforms(
 
 
 class VideoTransform(object):
+    """
+    VideoTransform applies a series of transformations to video frames including:
+    - Random resized cropping with optional motion shift
+    - Random horizontal flipping
+    - Auto-augmentation (if enabled)
+    - Normalization using the provided mean and std
+    - Random erasing (if reprob > 0)
+    """
 
     def __init__(
         self,

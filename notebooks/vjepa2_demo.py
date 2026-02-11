@@ -102,7 +102,7 @@ def run_sample_inference():
         "facebook/vjepa2-vitg-fpc64-384"  # Replace with your favored model, e.g. facebook/vjepa2-vitg-fpc64-384
     )
     # Path to local PyTorch weights
-    pt_model_path = "YOUR_MODEL_PATH"
+    pt_model_path = "/Metaworld/third_party/vjepa2/ckpts/vitg-384.pt"
 
     sample_video_path = "sample_video.mp4"
     # Download the video if not yet downloaded to local path
@@ -144,7 +144,7 @@ def run_sample_inference():
     )
 
     # Initialize the classifier
-    classifier_model_path = "YOUR_ATTENTIVE_PROBE_PATH"
+    classifier_model_path = "/Metaworld/third_party/vjepa2/ckpts/ssv2-vitg-384-64x2x3.pt"
     classifier = (
         AttentiveClassifier(embed_dim=model_pt.embed_dim, num_heads=16, depth=4, num_classes=174).cuda().eval()
     )
