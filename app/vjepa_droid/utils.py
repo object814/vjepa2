@@ -147,6 +147,7 @@ def init_video_model(
     use_extrinsics=False,
     old_pred=False,
 ):
+    # Initialise the video ViT encoder. It takes in a video input and returns a spatiotemporal representation of the video.
     encoder = video_vit.__dict__[model_name](
         img_size=crop_size,
         patch_size=patch_size,
@@ -160,6 +161,7 @@ def init_video_model(
         use_rope=use_rope,
     )
 
+    # Initialise the action predictor.
     predictor = vit_ac_pred.__dict__["vit_ac_predictor"](
         img_size=crop_size,
         patch_size=patch_size,

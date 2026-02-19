@@ -5,6 +5,12 @@
 # LICENSE file in the root directory of this source tree.
 #
 
+"""
+droid.py
+This script defines the DROIDVideoDataset class, which is a PyTorch Dataset for loading video data from the DROID dataset.
+It includes functions for initialising the dataset and data loader, as well as processing video frames and associated metadata such as robot states and camera extrinsics.
+"""
+
 import json
 import os
 from logging import getLogger
@@ -41,6 +47,42 @@ def init_data(
     camera_frame=False,
     tubelet_size=2,
 ):
+    """
+    Initialises the DROIDVideoDataset and creates a DataLoader for it.
+
+    Args:
+        data_path (str): Path to the dataset.
+        batch_size (int): Batch size for the DataLoader.
+        frames_per_clip (int): Number of frames per video clip.
+        fps (int): Frames per second to sample from the videos.
+        crop_size (int): Size to crop the video frames to.
+        rank (int): Rank of the current process for distributed training.
+        world_size (int): Total number of processes for distributed training.
+        camera_views (list): List of camera views to use.
+        stereo_view (bool): Whether to use stereo camera views.
+        drop_last (bool): Whether to drop the last incomplete batch.
+        num_workers (int): Number of worker processes for data loading.
+        pin_mem (bool): Whether to pin memory for faster data transfer to GPU.
+        persistent_workers (bool): Whether to keep worker processes alive after the initial dataset loading.
+        collator (function): Custom collate function for the DataLoader.
+        transform (function): Transformations to apply to the video frames.
+        camera_frame (bool): Whether to transform states to the camera frame.
+        tubelet_size (int): Number of frames to skip between sampled frames (for tubelet sampling).
+    Returns:
+        DataLoader: A PyTorch DataLoader for the DROIDVideoDataset.
+        DistributedSampler: A PyTorch DistributedSampler for the dataset.
+
+    Usage:
+        data_loader, dist_sampler = init_data(
+            data_path="/path/to/dataset",
+            ... # other parameters
+        )
+        # During training loop:
+        for batch in data_loader:
+            # process batch
+    
+    """
+    # Create the dataset
     dataset = DROIDVideoDataset(
         data_path=data_path,
         frames_per_clip=frames_per_clip,
@@ -51,10 +93,13 @@ def init_data(
         camera_frame=camera_frame,
     )
 
+    # Create the distributed sampler
+    # DistributedSampler will handle shuffling and partitioning of the dataset across multiple processes for distributed training
     dist_sampler = torch.utils.data.distributed.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=True
     )
 
+    # Create the DataLoader
     data_loader = torch.utils.data.DataLoader(
         dataset,
         collate_fn=collator,
@@ -86,6 +131,10 @@ def get_json(directory):
 
 class DROIDVideoDataset(torch.utils.data.Dataset):
     """Video classification dataset."""
+    """
+    DROIDVideoDataset is a PyTorch Dataset class designed to load video data from the DROID dataset.
+    It reads video files and associated metadata, processes the video frames, and extracts relevant information such as robot states and camera extrinsics.
+    """
 
     def __init__(
         self,
@@ -97,6 +146,16 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         transform=None,
         camera_frame=False,
     ):
+        """
+        Args:
+            data_path (str): Path to the dataset.
+            camera_views (list): List of camera views to use (e.g., ["left_mp4_path", "right_mp4_path"]).
+            frameskip (int): Number of frames to skip between sampled frames (for tubelet sampling).
+            frames_per_clip (int): Number of frames in each clip.
+            fps (int): Frames per second to sample from the videos.
+            transform (function): Transformations to apply to the video frames.
+            camera_frame (bool): Whether to transform states to the camera frame.
+        """
         self.data_path = data_path
         self.frames_per_clip = frames_per_clip
         self.frameskip = frameskip
@@ -118,6 +177,20 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         self.samples = samples
 
     def __getitem__(self, index):
+        """
+        Loads a video sample and its associated metadata (actions, states, extrinsics) from the dataset.
+        It randomly samples a video clip from the specified camera views, processes the video frames, and extracts the relevant information for training.
+
+        Args:
+            index (int): Index of the video sample to load. If the index is invalid, it will keep trying to load videos until it finds a valid sample.
+
+        Returns:
+            buffer (numpy array): The video frames for the sampled clip, after applying any specified transformations.
+            actions (numpy array): The action differences computed from the robot states for the sampled clip.
+            states (numpy array): The robot states for the sampled clip, potentially transformed to the camera frame.
+            extrinsics (numpy array): The camera extrinsics for the sampled clip.
+            indices (numpy array): The frame indices that were sampled from the video.
+        """
         path = self.samples[index]
 
         # -- keep trying to load videos until you find a valid sample
@@ -135,6 +208,15 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         return buffer, actions, states, extrinsics, indices
 
     def poses_to_diffs(self, poses):
+        """
+        Converts poses to differences in position and orientation.
+
+        Args:
+            poses (numpy array): The robot poses, shape [T, 7] where T is the number of time steps.
+        
+        Returns:
+            diffs (numpy array): The differences in position and orientation, shape [T-1, 6].
+        """
         xyz = poses[:, :3]  # shape [T, 3]
         thetas = poses[:, 3:6]  # euler angles, shape [T, 3]
         matrices = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in thetas]
@@ -147,6 +229,16 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         return np.concatenate([xyz_diff, angle_diff, closedness_delta], axis=1)
 
     def transform_frame(self, poses, extrinsics):
+        """
+        Transforms the robot states (rotation + translation) from the world frame to the camera frame using the provided camera extrinsics.
+
+        Args:
+            poses (numpy array): The robot poses in the world frame, shape [T, 7] where T is the number of time steps.
+            extrinsics (numpy array): The camera extrinsics, shape [T, 7] where T is the number of time steps.
+        
+        Returns:
+            transformed_poses (numpy array): The robot poses transformed to the camera frame, shape [T, 7].
+        """
         gripper = poses[:, -1:]
         poses = poses[:, :-1]
 
@@ -176,6 +268,20 @@ class DROIDVideoDataset(torch.utils.data.Dataset):
         return np.concatenate([new_pose, gripper], axis=1)
 
     def loadvideo_decord(self, path):
+        """
+        Loads a video sample and its associated metadata (actions, states, extrinsics) from the specified path using the Decord library.
+        It returns the same information as __getitem__, but is separated out for clarity and to handle potential exceptions during video loading.
+
+        Args:
+            path (str): The path to the video sample to load.
+        
+        Returns:
+            buffer (numpy array): The video frames for the sampled clip, after applying any specified transformations.
+            actions (numpy array): The action differences computed from the robot states for the sampled clip.
+            states (numpy array): The robot states for the sampled clip, potentially transformed to the camera frame.
+            extrinsics (numpy array): The camera extrinsics for the sampled clip.
+            indices (numpy array): The frame indices that were sampled from the video.
+        """
         # -- load metadata
         metadata = get_json(path)
         if metadata is None:

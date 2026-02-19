@@ -29,6 +29,7 @@ import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
 from app.vjepa_droid.droid import init_data
+# from app.vjepa_droid.metaworld import init_data
 from app.vjepa_droid.transforms import make_transforms
 from app.vjepa_droid.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
 from src.utils.distributed import init_distributed
@@ -52,6 +53,23 @@ logger = get_logger(__name__, force=True)
 
 
 def main(args, resume_preempt=False):
+    """
+    Main training loop for VJEPA on DROID dataset.
+    Pipeline overview:
+    1. Initialize distributed training environment and set device.
+    2. Parse configuration parameters from the provided args.
+    3. Initialize the video model (encoder, predictor, target encoder) based on the configuration.
+    4. Set up data transformations and data loaders for the DROID dataset.
+    5. Initialize the optimizer, learning rate scheduler, and weight decay scheduler.
+    6. Load pretrained weights if specified, and resume from checkpoint if available.
+    7. For each epoch:
+        a. For each iteration in the epoch:
+            i. Load a batch of video clips and associated metadata (actions, states, extrinsics).
+            ii. Perform a forward pass through the target encoder and predictor to get predictions.
+            iii. Compute the loss between the predictor's output and the target encoder's output.
+            iv. Backpropagate the loss and update the model parameters using the optimizer.
+            v. Log training statistics and save checkpoints at specified intervals.
+    """
     # ----------------------------------------------------------------------- #
     #  PASSED IN PARAMS FROM CONFIG FILE
     # ----------------------------------------------------------------------- #
@@ -87,14 +105,14 @@ def main(args, resume_preempt=False):
     compile_model = cfgs_model.get("compile_model", False)
     use_activation_checkpointing = cfgs_model.get("use_activation_checkpointing", False)
     model_name = cfgs_model.get("model_name")
-    pred_depth = cfgs_model.get("pred_depth")
-    pred_num_heads = cfgs_model.get("pred_num_heads", None)
-    pred_embed_dim = cfgs_model.get("pred_embed_dim")
-    pred_is_frame_causal = cfgs_model.get("pred_is_frame_causal", True)
+    pred_depth = cfgs_model.get("pred_depth") # number of transformer layers in predictor
+    pred_num_heads = cfgs_model.get("pred_num_heads", None) # number of attention heads in predictor, defaults to same as encoder
+    pred_embed_dim = cfgs_model.get("pred_embed_dim") # embedding dimension of predictor, defaults to same as encoder
+    pred_is_frame_causal = cfgs_model.get("pred_is_frame_causal", True) # whether predictor is causal at frame level (i.e. can only attend to past frames, not future frames). Note that predictor can still attend to all tokens within the current frame.
     uniform_power = cfgs_model.get("uniform_power", False)
-    use_rope = cfgs_model.get("use_rope", False)
     use_silu = cfgs_model.get("use_silu", False)
     use_pred_silu = cfgs_model.get("use_pred_silu", False)
+    use_rope = cfgs_model.get("use_rope", False)
     wide_silu = cfgs_model.get("wide_silu", True)
     use_extrinsics = cfgs_model.get("use_extrinsics", False)
 
@@ -119,8 +137,8 @@ def main(args, resume_preempt=False):
     # -- DATA AUGS
     cfgs_data_aug = args.get("data_aug")
     horizontal_flip = cfgs_data_aug.get("horizontal_flip", False)
-    ar_range = cfgs_data_aug.get("random_resize_aspect_ratio", [3 / 4, 4 / 3])
-    rr_scale = cfgs_data_aug.get("random_resize_scale", [0.3, 1.0])
+    ar_range = cfgs_data_aug.get("random_resize_aspect_ratio", [3 / 4, 4 / 3]) # aspect ratio range for random resized crop
+    rr_scale = cfgs_data_aug.get("random_resize_scale", [0.3, 1.0]) # scale range for random resized crop
     motion_shift = cfgs_data_aug.get("motion_shift", False)
     reprob = cfgs_data_aug.get("reprob", 0.0)
     use_aa = cfgs_data_aug.get("auto_augment", False)
@@ -144,7 +162,7 @@ def main(args, resume_preempt=False):
     start_lr = cfgs_opt.get("start_lr")
     lr = cfgs_opt.get("lr")
     final_lr = cfgs_opt.get("final_lr")
-    enc_lr_scale = cfgs_opt.get("enc_lr_scale", 1.0)
+    enc_lr_scale = cfgs_opt.get("enc_lr_scale", 1.0) # learning rate scale for encoder compared to predictor (e.g. 0.1 means encoder learns at 10% of the learning rate of predictor)
     betas = cfgs_opt.get("betas", (0.9, 0.999))
     eps = cfgs_opt.get("eps", 1.0e-8)
     # ----------------------------------------------------------------------- #
@@ -220,6 +238,7 @@ def main(args, resume_preempt=False):
         predictor.compile()
 
     video_collator = torch.utils.data.default_collate
+    # -- init data-aug transforms
     transform = make_transforms(
         random_horizontal_flip=horizontal_flip,
         random_resize_aspect_ratio=ar_range,
@@ -231,6 +250,7 @@ def main(args, resume_preempt=False):
     )
 
     # -- init data-loaders/samplers
+    # Data loader for DROID dataset. It loads buffer, actions, states, extrinsics, indices from the dataset.
     (unsupervised_loader, unsupervised_sampler) = init_data(
         data_path=dataset_path,
         batch_size=batch_size,
@@ -368,8 +388,10 @@ def main(args, resume_preempt=False):
 
             iter_retries = 0
             iter_successful = False
+            # Try to load a batch of data, with retries on failure.
             while not iter_successful:
                 try:
+                    # Load a batch of data from the data loader. The data includes video clips (buffers), actions, states, extrinsics, and indices.
                     sample = next(loader)
                     iter_successful = True
                 except StopIteration:
@@ -393,6 +415,7 @@ def main(args, resume_preempt=False):
                 extrinsics = sample[3].to(device, dtype=torch.float, non_blocking=True)  # [B T 7]
                 return (clips, actions, states, extrinsics)
 
+            # Get the video clips, actions, states, and extrinsics from the loaded batch. Move them to the appropriate device and data type.
             clips, actions, states, extrinsics = load_clips()
             data_elapsed_time_ms = (time.time() - itr_start_time) * 1000.0
 
@@ -406,8 +429,11 @@ def main(args, resume_preempt=False):
                 # --
 
                 def forward_target(c):
+                    # Stop gradient through the target encoder.
+                    # The target encoder is only used as a fixed target for the predictor, preventing model collapse where both encoder and predictor learn together.
                     with torch.no_grad():
                         c = c.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
+                        # Run the target encoder on the input video clips to get the target representations.
                         h = target_encoder(c)
                         h = h.view(batch_size, max_num_frames, -1, h.size(-1)).flatten(1, 2)
                         if normalize_reps:
@@ -417,21 +443,24 @@ def main(args, resume_preempt=False):
                 def forward_predictions(z):
 
                     def _step_predictor(_z, _a, _s, _e):
+                        # Run one step of the predictor, which takes in the current latent representations, actions, states, and extrinsics.
                         _z = predictor(_z, _a, _s, _e)
                         if normalize_reps:
                             _z = F.layer_norm(_z, (_z.size(-1),))
                         return _z
 
-                    # -- one step of predictor with teacher forcing
+                    # -- one step of predictor with teacher forcing (get next frame prediction using actual previous frame representation)
                     _z, _a, _s, _e = z[:, :-tokens_per_frame], actions, states[:, :-1], extrinsics[:, :-1]
+                    # z_tf is the predictor's output for the next frame's latent representation, using the actual previous frame's latent representation.
                     z_tf = _step_predictor(_z, _a, _s, _e)
 
-                    # -- full auto-regressive rollouts of predictor
+                    # -- full auto-regressive rollouts of predictor (rollout for multiple steps using predictors own previous predictions as input)
                     _z = torch.cat([z[:, : tokens_per_frame], z_tf[:, : tokens_per_frame]], dim=1)
                     for n in range(1, auto_steps):
                         _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], extrinsics[:, : n + 1]
                         _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
                         _z = torch.cat([_z, _z_nxt], dim=1)
+                    # z_ar is the predictor's output for the next frame's latent representation, using its own previous predictions (auto-regressive).
                     z_ar = _z[:, tokens_per_frame:]
 
                     return z_tf, z_ar
@@ -444,11 +473,15 @@ def main(args, resume_preempt=False):
                 with torch.cuda.amp.autocast(dtype=dtype, enabled=mixed_precision):
                     h = forward_target(clips)
                     z_tf, z_ar = forward_predictions(h)
+                    # jloss is the loss for the one-step prediction with teacher forcing.
                     jloss = loss_fn(z_tf, h)
+                    # sloss is the loss for the auto-regressive prediction without teacher forcing.
                     sloss = loss_fn(z_ar, h)
                     loss = jloss + sloss
 
                 # Step 2. Backward & step
+                # Loss on the prediction is backpropagated through the predictor and encoder.
+                # If mixed precision is enabled, use the scaler to scale the loss before backpropagation to prevent underflow, and unscale before stepping the optimizer.
                 if mixed_precision:
                     scaler.scale(loss).backward()
                     scaler.unscale_(optimizer)
