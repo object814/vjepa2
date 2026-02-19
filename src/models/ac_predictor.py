@@ -15,7 +15,11 @@ from src.utils.tensors import trunc_normal_
 
 
 class VisionTransformerPredictorAC(nn.Module):
-    """Action Conditioned Vision Transformer Predictor"""
+    """
+    Action Conditioned Vision Transformer Predictor
+    Differs from standard ViT, it takes in latent embeddings (features), along with action and state tokens, predicts the next frame's latent embeddings.
+    It acts as the predictor in the VJEPA world model, and is trained with a contrastive loss to align the predicted future embeddings with the actual future embeddings from the encoder.
+    """
 
     def __init__(
         self,
@@ -45,6 +49,37 @@ class VisionTransformerPredictorAC(nn.Module):
         use_extrinsics=False,
         **kwargs
     ):
+        """
+        Initialisation of the predictor.
+
+        Args:
+            img_size: size of input image (assumed square for now). This should be consistent with the encoder image size. 
+                      Because the input to the predictor is a flat sequence of patch embeddings, the predictor needs to know the original image size and patch size,
+                      to be able to 1) correctly interleave the action and state tokens into the corresponding frame, and 2) to construct the correct attention mask for frame causal attention.
+            patch_size: size of each patch. This should be consistent with the encoder patch size.
+            num_frames: number of frames in the input video. This should be consistent with the encoder number of frames.
+            tubelet_size: number of frames in each tubelet. This should be consistent with the encoder tubelet size.
+            embed_dim: dimension of the input patch embeddings from the encoder. This should be consistent with the encoder embedding dimension.
+            predictor_embed_dim: dimension of the embeddings used internally.
+            depth: number of transformer blocks in the predictor.
+            num_heads: number of attention heads in the transformer blocks.
+            mlp_ratio: expansion ratio for the MLP hidden dimension in the transformer blocks.
+            qkv_bias: if True, add bias to the query, key, value projections in the attention mechanism.
+            qk_scale: override default qk scale of head_dim ** -0.5 if set.
+            drop_rate: dropout rate for the output of each transformer block.
+            attn_drop_rate: dropout rate for the attention weights in the attention mechanism.
+            drop_path_rate: drop path rate for stochastic depth in the transformer blocks.
+            norm_layer: normalization layer to use in the transformer blocks.
+            init_std: standard deviation for weight initialization.
+            uniform_power: if True, use uniform power initialization for the positional embeddings, which has been shown to improve training stability for deeper transformers.
+            use_silu: if True, use SiLU activation in the MLP of the transformer blocks. If False, use GELU activation.
+            wide_silu: if True and use_silu is True, use a wider SiLU activation (SiLU(x) * 1.702) which has been shown to improve performance in some cases.
+            is_frame_causal: if True, apply a causal attention mask such that each frame can only attend to previous frames and itself, not future frames.
+            use_activation_checkpointing: if True, use activation checkpointing to save memory during training.
+            use_rope: if True, use RoPE (Rotary Positional Embeddings) for the attention mechanism.
+            action_embed_dim: dimension of the input action and state tokens.
+            use_extrinsics: if True, the predictor also takes in camera extrinsic information in addition to the action and state tokens.
+        """
         super().__init__()
         self.is_frame_causal = is_frame_causal
         self.use_extrinsics = use_extrinsics

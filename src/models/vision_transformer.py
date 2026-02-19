@@ -3,6 +3,13 @@
 # This source code is licensed under the MIT license found in the
 # LICENSE file in the root directory of this source tree.
 
+"""
+Vision Transformer implementation for VJEPA 2.
+The VisionTransformer class defines a ViT architecture that can be used for both image and video inputs.
+It includes options for using RoPE positional embeddings, activation checkpointing, and handling non-square inputs.
+The module also includes helper functions for initializing weights and interpolating positional embeddings when the input size changes
+"""
+
 import math
 from functools import partial
 
@@ -47,6 +54,34 @@ class VisionTransformer(nn.Module):
         handle_nonsquare_inputs=True,
         **kwargs
     ):
+        """
+        Args:
+            img_size (tuple): Size of the input image (height, width).
+            patch_size (int): Size of the patches to divide the image into.
+            num_frames (int): Number of frames in the input video (1 for image input).
+            tubelet_size (int): Number of frames in each tubelet (for video input). Baiscallym [tubelet_size] frames along the temporal dimension are treated as a single "patch" for videos.
+            in_chans (int): Number of input channels (e.g., 3 for RGB).
+            embed_dim (int): Dimension of the token embeddings. This is the output dimension of the patch embedding layer and the input/output dimension of the transformer blocks.
+            depth (int): Number of transformer blocks.
+            num_heads (int): Number of attention heads in the transformer blocks.
+            mlp_ratio (float): Ratio of the hidden dimension in the MLP to the embedding dimension. Typically 4, meaning the hidden layer in the feedforward network for each transformer block will have dimension 4 * embed_dim.
+            qkv_bias (bool): Whether to include bias terms in the query, key, value projections. Typically True with an expression of Wx+b, where b is the bias term.
+            qk_scale (float): Scaling factor for the query and key projections. If None, defaults to 1/sqrt(d_k(means the embed_dim)). Prevent the dot product values from getting too large.
+            drop_rate (float): Dropout rate for the token embeddings.
+            attn_drop_rate (float): Dropout rate for the attention weights.
+            drop_path_rate (float): Dropout rate for the stochastic depth.
+            norm_layer (nn.Module): Normalization layer to use.
+            init_std (float): Standard deviation for weight initialization.
+            out_layers (list): List of block indices to output intermediate features from. If None, only output final features.
+            uniform_power (bool): Whether to use uniform power initialization for positional embeddings.
+            use_silu (bool): Whether to use SiLU activation function in the MLP layers.
+            wide_silu (bool): Whether to use a wider version of SiLU (SiLU(x) * 1.702) in the MLP layers.
+            use_sdpa (bool): Whether to use scaled dot-product attention (SDPA) or unscaled attention.
+            use_activation_checkpointing (bool): Whether to use activation checkpointing to save memory during training.
+            use_rope (bool): Whether to use RoPE positional embeddings instead of absolute positional embeddings.
+            handle_nonsquare_inputs (bool): Whether to handle non-square inputs by computing separate grid sizes for height and width. If False, will assume input is square and use the same grid size for both dimensions.
+        
+        """
         super().__init__()
         self.num_features = self.embed_dim = embed_dim
         self.num_heads = num_heads
@@ -67,11 +102,13 @@ class VisionTransformer(nn.Module):
 
         # Tokenize pixels with convolution
         if self.is_video:
+            # For video input, use a 3D convolution to tokenize spato-temporal tubelets.
             self.patch_embed = PatchEmbed3D(
                 patch_size=patch_size, tubelet_size=tubelet_size, in_chans=in_chans, embed_dim=embed_dim
             )
             self.num_patches = (num_frames // tubelet_size) * (img_size[0] // patch_size) * (img_size[1] // patch_size)
         else:
+            # For image input, use a 2D convolution to tokenize spatial patches.
             self.patch_embed = PatchEmbed(patch_size=patch_size, in_chans=in_chans, embed_dim=embed_dim)
             self.num_patches = (img_size[0] // patch_size) * (img_size[1] // patch_size)
 
@@ -81,11 +118,13 @@ class VisionTransformer(nn.Module):
         if self.use_rope:
             self.pos_embed = None
         else:
+            # Positional embedding will be initialized with sin/cos functions and is not learnable. It is added to the patch embeddings to provide positional information to the model.
             self.pos_embed = nn.Parameter(torch.zeros(1, self.num_patches, embed_dim), requires_grad=False)
 
         # Attention Blocks
         self.blocks = nn.ModuleList(
             [
+                # Typical transformer attention block with residual connections and drop path for regularization.
                 Block(
                     use_rope=use_rope,
                     grid_size=img_size[0] // patch_size,
@@ -116,6 +155,11 @@ class VisionTransformer(nn.Module):
         self._rescale_blocks()
 
     def _init_pos_embed(self, pos_embed):
+        """
+        Initialise the positional embedding with sin/cos functions.
+        For videos, use 3D sin/cos positional embeddings that encode position in time, height, and width. 
+        For images, use 2D sin/cos positional embeddings that encode position in height and width.
+        """
         embed_dim = pos_embed.size(-1)
         grid_size = self.img_height // self.patch_size  # TODO: update; currently assumes square input
         if self.is_video:

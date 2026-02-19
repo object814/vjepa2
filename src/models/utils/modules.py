@@ -522,7 +522,27 @@ class Block(nn.Module):
         use_rope=False,
         **kwargs,
     ):
+        """
+        Typical transformer block with optional RoPE attention. If use_rope is False, falls back to standard attention.
+        
+        x = x + mlp(norm(x + attn(x))))
+
+        Args:
+            dim: embedding dimension
+            num_heads: number of attention heads
+            mlp_ratio: expansion ratio for MLP hidden dimension
+            qkv_bias: if True, add bias to qkv projections
+            qk_scale: override default qk scale of head_dim ** -0.5 if set
+            drop: dropout rate for output projection and MLP
+            attn_drop: dropout rate for attention probabilities
+            drop_path: stochastic depth rate for block
+            act_layer: activation function for MLP
+            wide_silu: if True and act_layer is SiLU, use wider hidden dimension for SwiGLU (2/3 of mlp_hidden_dim) and project back to mlp_hidden_dim. If False, use mlp_hidden_dim for the hidden dimension of SwiGLU, which results in a narrower MLP.
+            norm_layer: normalization layer to use
+            use_sdpa: if True, use scaled dot product attention with torch's built in SDPA kernel. If False, use manual attention implementation which may be more memory efficient for long sequences.
+        """
         super().__init__()
+        # Normalization layer before attention.
         self.norm1 = norm_layer(dim)
         if use_rope:
             self.attn = RoPEAttention(
@@ -547,8 +567,10 @@ class Block(nn.Module):
                 is_causal=is_causal,
                 proj_drop=drop,
             )
-
+        # Drop path for stochastic depth. Drop path randomly drops entire blocks during training (output of the block will be the same as input, effectively skipping the block).
+        # This is used as a regularization technique and can be more effective than dropout for deeper transformers.
         self.drop_path = DropPath(drop_path) if drop_path > 0.0 else nn.Identity()
+        # Normalization layer before feed forward network.
         self.norm2 = norm_layer(dim)
         mlp_hidden_dim = int(dim * mlp_ratio)
         if act_layer is nn.SiLU:
@@ -563,6 +585,9 @@ class Block(nn.Module):
             y = self.attn(self.norm1(x), mask=mask, attn_mask=attn_mask, T=T, H_patches=H_patches, W_patches=W_patches)
         else:
             y = self.attn(self.norm1(x), mask=mask, attn_mask=attn_mask)
+        # Transformer style residual connection
+        # First, update the attention output with a residual connection x += attn(x)
+        # Then, apply MLP to the updated x and add another residual connection x += mlp(norm(x + attn(x))))
         x = x + self.drop_path(y)
         x = x + self.drop_path(self.mlp(self.norm2(x)))
         return x
