@@ -165,32 +165,28 @@ def cem(
 
 def compute_new_pose(pose, action):
     """
-    Compute new pose/state from current pose and action.
-    
-    For Metaworld, state format is: ee_pos(3) + ee_vel(3) + gripper(1) = 7D
-    Action format: state delta (position_delta(3) + velocity_delta(3) + gripper_delta(1))
-    
-    Note: The original function was designed for robots with orientation (euler angles),
-    but Metaworld training uses velocity instead of orientation. This version handles
-    the Metaworld state format correctly by simply adding the action (state delta) to
-    the current state.
-    
-    :param pose: [B, T=1, 7] - current state
-    :param action: [B, T=1, 7] - action (state delta)
-    :returns: [B, T=1, 7] - new state
+    :param pose: [B, T=1, 7]
+    :param action: [B, T=1, 7]
+    :returns: [B, T=1, 7]
     """
     device, dtype = pose.device, pose.dtype
     pose = pose[:, 0].cpu().numpy()
     action = action[:, 0].cpu().numpy()
-    
-    # For Metaworld: state = ee_pos(3) + ee_vel(3) + gripper(1)
-    # Action is state delta, so simply add
-    new_xyz = pose[:, :3] + action[:, :3]      # new position
-    new_vel = pose[:, 3:6] + action[:, 3:6]    # new velocity
-    new_gripper = pose[:, 6:7] + action[:, 6:7]  # new gripper
-    new_gripper = np.clip(new_gripper, 0, 1)
-    
-    new_pose = np.concatenate([new_xyz, new_vel, new_gripper], axis=-1)
+    # -- compute delta xyz
+    new_xyz = pose[:, :3] + action[:, :3]
+    # -- compute delta theta
+    thetas = pose[:, 3:6]
+    delta_thetas = action[:, 3:6]
+    matrices = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in thetas]
+    delta_matrices = [Rotation.from_euler("xyz", theta, degrees=False).as_matrix() for theta in delta_thetas]
+    angle_diff = [delta_matrices[t] @ matrices[t] for t in range(len(matrices))]
+    angle_diff = [Rotation.from_matrix(mat).as_euler("xyz", degrees=False) for mat in angle_diff]
+    new_angle = np.stack([d for d in angle_diff], axis=0)  # [B, 7]
+    # -- compute delta gripper
+    new_closedness = pose[:, -1:] + action[:, -1:]
+    new_closedness = np.clip(new_closedness, 0, 1)
+    # -- new pose
+    new_pose = np.concatenate([new_xyz, new_angle, new_closedness], axis=-1)
     return torch.from_numpy(new_pose).to(device).to(dtype)[:, None]
 
 
