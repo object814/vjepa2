@@ -35,3 +35,6 @@ ckpts/
 output/
 sample_video.mp4
 ssv2_classes.json
+
+train/
+mpc_output/
