@@ -30,9 +30,12 @@ parser.add_argument(
     "The main code runs the main process, which makes it easier to \
     debug with checkpointing.",
 )
+parser.add_argument("--wandb-entity", type=str, default="haoyu-a2i")
+parser.add_argument("--wandb-project", type=str, default="CCLB_VJEPA2")
+parser.add_argument("--wandb-run-name", type=str, default=None)
 
 
-def process_main(rank, fname, world_size, devices):
+def process_main(rank, fname, world_size, devices, wandb_config=None):
     import os
 
     os.environ["CUDA_VISIBLE_DEVICES"] = str(devices[rank].split(":")[-1])
@@ -65,6 +68,10 @@ def process_main(rank, fname, world_size, devices):
         with open(params_path, "w") as f:
             yaml.dump(params, f)
 
+    # Attach wandb config to params
+    if wandb_config is not None:
+        params["wandb"] = wandb_config
+
     # Init distributed (access to comm between GPUS on same machine)
     world_size, rank = init_distributed(rank_and_world_size=(rank, world_size))
     logger.info(f"Running... (rank: {rank}/{world_size})")
@@ -75,10 +82,15 @@ def process_main(rank, fname, world_size, devices):
 
 if __name__ == "__main__":
     args = parser.parse_args()
+    wandb_config = {
+        "entity": args.wandb_entity,
+        "project": args.wandb_project,
+        "run_name": args.wandb_run_name,
+    }
     if args.debugmode:
-        process_main(rank=0, fname=args.fname, world_size=1, devices=["cuda:0"])
+        process_main(rank=0, fname=args.fname, world_size=1, devices=["cuda:0"], wandb_config=wandb_config)
     else:
         num_gpus = len(args.devices)
         mp.set_start_method("spawn")
         for rank in range(num_gpus):
-            mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices)).start()
+            mp.Process(target=process_main, args=(rank, args.fname, num_gpus, args.devices, wandb_config)).start()

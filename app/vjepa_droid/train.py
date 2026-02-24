@@ -28,11 +28,17 @@ import torch.multiprocessing as mp
 import torch.nn.functional as F
 from torch.nn.parallel import DistributedDataParallel
 
-from app.vjepa_droid.droid import init_data
+# from app.vjepa_droid.droid import init_data
+from app.vjepa_droid.metaworld import init_data # TODO - better data loading abstraction to support multiple datasets
 from app.vjepa_droid.transforms import make_transforms
 from app.vjepa_droid.utils import init_opt, init_video_model, load_checkpoint, load_pretrained
 from src.utils.distributed import init_distributed
 from src.utils.logging import AverageMeter, CSVLogger, get_logger, gpu_timer
+
+try:
+    import wandb
+except ImportError:
+    wandb = None
 
 # --
 log_timings = True
@@ -168,6 +174,23 @@ def main(args, resume_preempt=False):
     else:
         device = torch.device("cuda:0")
         torch.cuda.set_device(device)
+
+    # -- init wandb (rank 0 only)
+    cfgs_wandb = args.get("wandb", {})
+    use_wandb = wandb is not None and rank == 0
+    if use_wandb:
+        wandb_run_name = cfgs_wandb.get("run_name", None)
+        if wandb_run_name is None:
+            wandb_run_name = os.path.basename(folder)
+        wandb.init(
+            entity=cfgs_wandb.get("entity", "haoyu-a2i"),
+            project=cfgs_wandb.get("project", "CCLB_VJEPA2"),
+            name=wandb_run_name,
+            config=args,
+            dir=folder,
+            resume="allow",
+        )
+        logger.info(f"Wandb initialized: {wandb.run.url}")
 
     # -- log/checkpointing paths
     log_file = os.path.join(folder, f"log_r{rank}.csv")
@@ -509,12 +532,45 @@ def main(args, resume_preempt=False):
                             data_elapsed_time_meter.avg,
                         )
                     )
+                if use_wandb:
+                    global_step = epoch * ipe + itr
+                    wandb.log(
+                        {
+                            "train/loss": loss,
+                            "train/jloss": jloss,
+                            "train/sloss": sloss,
+                            "train/loss_avg": loss_meter.avg,
+                            "train/jloss_avg": jloss_meter.avg,
+                            "train/sloss_avg": sloss_meter.avg,
+                            "train/lr": _new_lr,
+                            "train/wd": _new_wd,
+                            "train/gpu_mem_MB": torch.cuda.max_memory_allocated() / 1024.0**2,
+                            "train/iter_time_ms": iter_elapsed_time_ms,
+                            "train/gpu_time_ms": gpu_etime_ms,
+                            "train/data_time_ms": data_elapsed_time_ms,
+                            "epoch": epoch + 1,
+                        },
+                        step=global_step,
+                    )
 
             log_stats()
             assert not np.isnan(loss), "loss is nan"
 
         # -- Save Checkpoint
         logger.info("avg. loss %.3f" % loss_meter.avg)
+        if use_wandb:
+            wandb.log(
+                {
+                    "epoch/loss_avg": loss_meter.avg,
+                    "epoch/jloss_avg": jloss_meter.avg,
+                    "epoch/sloss_avg": sloss_meter.avg,
+                    "epoch/iter_time_avg_ms": iter_time_meter.avg,
+                    "epoch/gpu_time_avg_ms": gpu_time_meter.avg,
+                    "epoch/data_time_avg_ms": data_elapsed_time_meter.avg,
+                    "epoch": epoch + 1,
+                },
+                step=(epoch + 1) * ipe - 1,
+            )
         # -- Save Last
         if epoch % CHECKPOINT_FREQ == 0 or epoch == (num_epochs - 1):
             save_checkpoint(epoch + 1, latest_path)
@@ -522,3 +578,6 @@ def main(args, resume_preempt=False):
                 save_every_file = f"e{epoch}.pt"
                 save_every_path = os.path.join(folder, save_every_file)
                 save_checkpoint(epoch + 1, save_every_path)
+
+    if use_wandb:
+        wandb.finish()
