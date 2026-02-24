@@ -13,6 +13,8 @@ import gymnasium as gym
 from pathlib import Path
 
 from app.vjepa_droid.transforms import make_transforms
+from app.vjepa_droid.utils import init_video_model
+from src.utils.checkpoint_loader import robust_checkpoint_loader
 from utils.mpc_utils import compute_new_pose
 from utils.world_model_wrapper import WorldModel
 
@@ -119,14 +121,53 @@ def loss_fn(z, h):
 # ==========================================================
 
 TASK_NAME = "pick-place-v3"
-IMAGE_SIZE = 256
+IMAGE_SIZE = 224
 T = 10
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NSAMPLES = 5
 GRID_SIZE = 0.075
-camera_names = ["topview", "front", "gripperPOV"]
+camera_names = ["topview", "front"]
+
+ENCODER_CKPT = "/Metaworld/third_party/vjepa2/ckpts/vitg.pt"
+PREDICTOR_CKPT = "/Metaworld/third_party/vjepa2/train/metaworld_predictor_run1/latest.pt"
 
 print("Using device:", DEVICE)
+
+
+def _sanitize_state_dict(state_dict):
+    cleaned = {}
+    for key, value in state_dict.items():
+        key = key.replace("module.", "")
+        key = key.replace("backbone.", "")
+        cleaned[key] = value
+    return cleaned
+
+
+def _find_state_dict(checkpoint, preferred_keys):
+    for key in preferred_keys:
+        if key in checkpoint and isinstance(checkpoint[key], dict):
+            return checkpoint[key], key
+
+    if "state_dict" in checkpoint and isinstance(checkpoint["state_dict"], dict):
+        return checkpoint["state_dict"], "state_dict"
+
+    if isinstance(checkpoint, dict) and checkpoint:
+        first_value = next(iter(checkpoint.values()))
+        if torch.is_tensor(first_value):
+            return checkpoint, "<root>"
+
+    raise KeyError(
+        f"No state_dict found. Tried keys: {preferred_keys} + ['state_dict', '<root>']. "
+        f"Available keys: {list(checkpoint.keys())}"
+    )
+
+
+def _load_module_from_ckpt(module, ckpt_path, preferred_keys, module_name):
+    checkpoint = robust_checkpoint_loader(ckpt_path, map_location=torch.device("cpu"))
+    state_dict, loaded_key = _find_state_dict(checkpoint, preferred_keys)
+    state_dict = _sanitize_state_dict(state_dict)
+    msg = module.load_state_dict(state_dict, strict=False)
+    print(f"Loaded {module_name} from {ckpt_path} (key='{loaded_key}') with msg: {msg}")
 
 
 # ==========================================================
@@ -155,11 +196,41 @@ def make_env():
 # Load VJEPA2-AC
 # ==========================================================
 
-print("Loading pretrained V-JEPA2-AC...")
+print("Initializing V-JEPA2-AC from training config and loading custom checkpoints...")
 
-encoder, predictor = torch.hub.load(
-    "facebookresearch/vjepa2",
-    "vjepa2_ac_vit_giant"
+encoder, predictor = init_video_model(
+    device=DEVICE,
+    patch_size=16,
+    max_num_frames=512,
+    tubelet_size=2,
+    model_name="vit_giant_xformers",
+    crop_size=IMAGE_SIZE,
+    pred_depth=24,
+    pred_num_heads=16,
+    pred_embed_dim=1024,
+    uniform_power=True,
+    use_sdpa=True,
+    use_rope=True,
+    use_silu=False,
+    use_pred_silu=False,
+    wide_silu=True,
+    pred_is_frame_causal=True,
+    use_activation_checkpointing=False,
+    action_embed_dim=7,
+    use_extrinsics=False,
+)
+
+_load_module_from_ckpt(
+    encoder,
+    ENCODER_CKPT,
+    preferred_keys=["target_encoder", "encoder", "model"],
+    module_name="encoder",
+)
+_load_module_from_ckpt(
+    predictor,
+    PREDICTOR_CKPT,
+    preferred_keys=["predictor", "model"],
+    module_name="predictor",
 )
 
 encoder = encoder.to(DEVICE).eval()
