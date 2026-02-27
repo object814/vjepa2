@@ -5,12 +5,14 @@ import os
 os.environ["MUJOCO_GL"] = "osmesa"
 os.environ["XDG_RUNTIME_DIR"] = "/tmp"
 
+import argparse
 import numpy as np
 import matplotlib.pyplot as plt
 import torch
 import torch.nn.functional as F
 import gymnasium as gym
 from pathlib import Path
+from PIL import Image, ImageDraw, ImageFont
 
 from app.vjepa_droid.transforms import make_transforms
 from app.vjepa_droid.utils import init_video_model
@@ -120,17 +122,48 @@ def loss_fn(z, h):
 # CONFIG
 # ==========================================================
 
+parser = argparse.ArgumentParser(description="V-JEPA2 action inference")
+parser.add_argument(
+    "--model", type=str, default="giant",
+    choices=["giant", "large"],
+    help="Encoder backbone: 'giant' (vit_giant_xformers) or 'large' (vit_large)",
+)
+args = parser.parse_args()
+
+# --- Model-dependent config ---
+MODEL_CONFIGS = {
+    "giant": {
+        "model_name": "vit_giant_xformers",
+        "encoder_ckpt": "/Metaworld/third_party/vjepa2/ckpts/vitg.pt",
+        "predictor_ckpt": "/Metaworld/third_party/vjepa2/train/metaworld_predictor_run1/latest.pt",
+        "pred_depth": 24,
+        "pred_num_heads": 16,
+        "pred_embed_dim": 1024,
+    },
+    "large": {
+        "model_name": "vit_large",
+        "encoder_ckpt": "/Metaworld/third_party/vjepa2/ckpts/vitl.pt",
+        "predictor_ckpt": "/Metaworld/third_party/vjepa2/train/metaworld_pickplace_vitl_0225/e300.pt",
+        "pred_depth": 12,
+        "pred_num_heads": 12,
+        "pred_embed_dim": 384,
+    },
+}
+
+MCFG = MODEL_CONFIGS[args.model]
+
 TASK_NAME = "pick-place-v3"
 IMAGE_SIZE = 224
-T = 10
+T = 40
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NSAMPLES = 5
 GRID_SIZE = 0.075
-camera_names = ["topview", "front"]
+camera_names = ["front"]
 
-ENCODER_CKPT = "/Metaworld/third_party/vjepa2/ckpts/vitg.pt"
-PREDICTOR_CKPT = "/Metaworld/third_party/vjepa2/train/metaworld_predictor_run1/latest.pt"
+ENCODER_CKPT = MCFG["encoder_ckpt"]
+PREDICTOR_CKPT = MCFG["predictor_ckpt"]
 
+print(f"Using model: {args.model} ({MCFG['model_name']})")
 print("Using device:", DEVICE)
 
 
@@ -203,11 +236,11 @@ encoder, predictor = init_video_model(
     patch_size=16,
     max_num_frames=512,
     tubelet_size=2,
-    model_name="vit_giant_xformers",
+    model_name=MCFG["model_name"],
     crop_size=IMAGE_SIZE,
-    pred_depth=24,
-    pred_num_heads=16,
-    pred_embed_dim=1024,
+    pred_depth=MCFG["pred_depth"],
+    pred_num_heads=MCFG["pred_num_heads"],
+    pred_embed_dim=MCFG["pred_embed_dim"],
     uniform_power=True,
     use_sdpa=True,
     use_rope=True,
@@ -264,16 +297,22 @@ print("Initialising environment...")
 for _ in range(5):
     obs, r, terminated, truncated, _ = env.step(np.zeros(4, dtype=np.float32))
 
+initial_ee_pos = obs["proprio"][:3].copy()
+
+# Record rendered frames for GIF (render from the same camera used for observations)
+gt_render_frames = [env.render(camera_name=camera_names[0]).copy()]
+
 print("Collecting rollout...")
 
 for t in range(T):
     print(f"Simulation Step {t}/{T}")
-    action = np.array([0.02, -0.02, 0.01, 0.1])  # Move in a straight line
+    action = np.array([0.0, 0.0, 0.2, 0.0])  # Move in a straight line
     obs, r, terminated, truncated, _ = env.step(action)
 
     frames.append(obs["image"])
     states.append(obs["proprio"])
     actions.append(action)
+    gt_render_frames.append(env.render(camera_name=camera_names[0]).copy())
 
     if terminated or truncated:
         obs, _ = env.reset()
@@ -319,6 +358,17 @@ for i, cam in enumerate(camera_tensors):
 print("States:", states.shape)
 print("Actions:", actions.shape)
 
+# Save real trajectory EE positions for later comparison
+real_ee_positions = np.concatenate(
+    [initial_ee_pos[np.newaxis, :],
+     states[0, :, :3].cpu().numpy()],
+    axis=0
+)  # (T+1, 3)
+goal_ee_pos = real_ee_positions[-1]
+print(f"\nReal trajectory: {len(real_ee_positions)} waypoints")
+print(f"Start EE pos: {real_ee_positions[0]}")
+print(f"Goal  EE pos: {goal_ee_pos}")
+
 # ==========================================================
 # Forward encoding and Energy Landscape Visualisation
 # ==========================================================
@@ -326,7 +376,7 @@ print("Running forward encoding and visualising energy landscape for the sampled
 
 nsamples = 5
 grid_size = 0.01
-output_dir = "./output"
+output_dir = "./output_inference_+z_only"
 os.makedirs(output_dir, exist_ok=True)
 
 with torch.no_grad():
@@ -386,18 +436,16 @@ world_model = WorldModel(
     predictor=predictor,
     tokens_per_frame=tokens_per_frame,
     transform=transform,
-    # Doing very few CEM iterations with very few samples just to run efficiently on CPU...
-    # ... increase cem_steps and samples for more accurate optimization of energy landscape
     mpc_args={
         "rollout": 2,
-        "samples": 25,
+        "samples": 500,
         "topk": 10,
-        "cem_steps": 2,
+        "cem_steps": 15,
         "momentum_mean": 0.15,
         "momentum_mean_gripper": 0.15,
         "momentum_std": 0.75,
         "momentum_std_gripper": 0.15,
-        "maxnorm": 0.075,
+        "maxnorm": 0.1,
         "verbose": True
     },
     normalize_reps=True,
@@ -415,4 +463,241 @@ with torch.no_grad():
         print(f"Actions returned by planning with CEM (x,y,z) = ({actions[0, 0]:.2f},{actions[0, 1]:.2f} {actions[0, 2]:.2f})")
 
 env.close()
+
+# ==========================================================
+# Closed-Loop MPC Policy Execution in Interactive Environments
+# ==========================================================
+print("\n" + "=" * 60)
+print("CLOSED-LOOP MPC POLICY EXECUTION")
+print("=" * 60)
+
+
+def encode_frame(image_np, cam_idx):
+    """
+    Encode a single camera frame from a multi-camera observation.
+    Uses the same encoding path as forward_target (raw float, no transform)
+    to ensure representations are comparable to the goal.
+    """
+    cam_image = image_np[:, :, 3 * cam_idx : 3 * (cam_idx + 1)]  # (H, W, 3)
+    cam_t = torch.from_numpy(cam_image).float().to(DEVICE)
+    cam_t = cam_t.permute(2, 0, 1).unsqueeze(1).unsqueeze(0)  # (1, 3, 1, H, W)
+    B, C, T_enc, H_enc, W_enc = cam_t.size()
+    c = cam_t.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
+    h = encoder(c)
+    h = h.view(B, T_enc, -1, h.size(-1)).flatten(1, 2)
+    h = F.layer_norm(h, (h.size(-1),))
+    return h  # (1, tokens_per_frame, D)
+
+
+# Compute goal representations for each camera from the real trajectory
+camera_z_goals = {}
+with torch.no_grad():
+    for cam_idx, cam in enumerate(camera_tensors):
+        h_full = forward_target(cam)
+        camera_z_goals[cam_idx] = h_full[:, -tokens_per_frame:]  # last frame
+
+MAX_MPC_STEPS = 100
+GOAL_THRESHOLD = 0.01  # 1 cm
+
+mpc_trajectories = {}  # cam_idx -> (N, 3) numpy array of ee positions
+mpc_render_frames = {}  # cam_idx -> list of rendered frames
+
+for cam_idx in range(num_cameras):
+    cam_name = camera_names[cam_idx]
+    print(f"\n--- Closed-loop MPC with camera: {cam_name} ---")
+
+    # Fresh interactive environment with the same seed
+    interactive_env = make_env()
+    obs_i, _ = interactive_env.reset(seed=0)
+
+    # Same warmup as the real env
+    for _ in range(5):
+        obs_i, _, _, _, _ = interactive_env.step(np.zeros(4, dtype=np.float32))
+
+    z_goal_cam = camera_z_goals[cam_idx]
+    ee_traj = [obs_i["proprio"][:3].copy()]
+    cam_render_frames = [interactive_env.render(camera_name=cam_name).copy()]
+
+    with torch.no_grad():
+        for mpc_step in range(MAX_MPC_STEPS):
+            # Encode current frame for this camera
+            z_n = encode_frame(obs_i["image"], cam_idx)
+
+            # Current proprio state as (1, 1, 7)
+            s_n = (
+                torch.from_numpy(obs_i["proprio"])
+                .float()
+                .unsqueeze(0)
+                .unsqueeze(0)
+                .to(DEVICE)
+            )
+
+            # Plan with CEM
+            mpc_action = world_model.infer_next_action(z_n, s_n, z_goal_cam)
+            # mpc_action shape: (rollout, 7)
+
+            # Convert 7D -> 4D Metaworld action  [dx, dy, dz, gripper]
+            a7 = mpc_action[0].cpu().numpy()  # first rollout step, shape (7,)
+            action_4d = np.array(
+                [a7[0], a7[1], a7[2], a7[6]], dtype=np.float32
+            )
+
+            # Execute in interactive environment
+            obs_i, _, terminated, truncated, _ = interactive_env.step(action_4d)
+            current_ee = obs_i["proprio"][:3].copy()
+            ee_traj.append(current_ee)
+            cam_render_frames.append(interactive_env.render(camera_name=cam_name).copy())
+
+            dist = np.linalg.norm(current_ee - goal_ee_pos)
+            print(
+                f"  Step {mpc_step + 1:3d} | "
+                f"ee=({current_ee[0]:.4f}, {current_ee[1]:.4f}, {current_ee[2]:.4f}) | "
+                f"dist_to_goal={dist:.4f}"
+            )
+
+            if dist < GOAL_THRESHOLD:
+                print(f"  >>> Reached goal! (dist={dist:.4f} < {GOAL_THRESHOLD})")
+                break
+            if terminated or truncated:
+                print("  >>> Episode terminated / truncated.")
+                break
+
+    interactive_env.close()
+    mpc_trajectories[cam_idx] = np.array(ee_traj)
+    mpc_render_frames[cam_idx] = cam_render_frames
+    print(f"  Camera '{cam_name}': {len(ee_traj) - 1} MPC steps executed.")
+
+
+# ==========================================================
+# 3D Trajectory Visualisation
+# ==========================================================
+print("\nGenerating 3D trajectory comparison plot...")
+
+fig = plt.figure(figsize=(12, 9))
+ax = fig.add_subplot(111, projection="3d")
+
+# Real trajectory
+ax.plot(
+    real_ee_positions[:, 0],
+    real_ee_positions[:, 1],
+    real_ee_positions[:, 2],
+    "b-o",
+    label="Real Trajectory",
+    markersize=4,
+    linewidth=2,
+)
+
+# MPC trajectories per camera
+cam_colors = ["r", "g", "m", "c"]
+cam_markers = ["s", "D", "^", "v"]
+for cam_idx in range(num_cameras):
+    traj = mpc_trajectories[cam_idx]
+    cam_name = camera_names[cam_idx]
+    color = cam_colors[cam_idx % len(cam_colors)]
+    marker = cam_markers[cam_idx % len(cam_markers)]
+    ax.plot(
+        traj[:, 0],
+        traj[:, 1],
+        traj[:, 2],
+        linestyle="-",
+        color=color,
+        marker=marker,
+        label=f"MPC ({cam_name})",
+        markersize=3,
+        linewidth=1.5,
+    )
+
+# Start and goal markers
+ax.scatter(
+    *real_ee_positions[0],
+    c="lime",
+    s=150,
+    marker="^",
+    label="Start",
+    zorder=5,
+    edgecolors="k",
+)
+ax.scatter(
+    *goal_ee_pos,
+    c="red",
+    s=200,
+    marker="*",
+    label="Goal",
+    zorder=5,
+    edgecolors="k",
+)
+
+ax.set_xlabel("X (m)")
+ax.set_ylabel("Y (m)")
+ax.set_zlabel("Z (m)")
+ax.set_title("End-Effector Trajectories: Real vs MPC Policy")
+ax.legend(loc="best")
+plt.tight_layout()
+
+plot_path = os.path.join(output_dir, "ee_trajectories_3d.png")
+plt.savefig(plot_path, dpi=300, bbox_inches="tight")
+plt.close(fig)
+print(f"Saved 3D trajectory plot to {plot_path}")
+
+# ==========================================================
+# Create side-by-side rollout GIF
+# ==========================================================
+print("\nCreating side-by-side rollout GIF...")
+
+# Collect all frame lists: [ground_truth, mpc_cam0, mpc_cam1, ...]
+all_frame_lists = [gt_render_frames] + [mpc_render_frames[i] for i in range(num_cameras)]
+labels = ["Ground Truth"] + [f"MPC ({camera_names[i]})" for i in range(num_cameras)]
+
+# Pad shorter sequences by repeating the last frame
+max_len = max(len(fl) for fl in all_frame_lists)
+for fl in all_frame_lists:
+    while len(fl) < max_len:
+        fl.append(fl[-1].copy())
+
+def add_label(frame, text):
+    """Add a text label to the top of a rendered frame."""
+    img = Image.fromarray(frame)
+    draw = ImageDraw.Draw(img)
+    try:
+        font = ImageFont.truetype("/usr/share/fonts/truetype/dejavu/DejaVuSans-Bold.ttf", 16)
+    except (IOError, OSError):
+        font = ImageFont.load_default()
+    # Draw text with dark background for readability
+    bbox = draw.textbbox((0, 0), text, font=font)
+    tw, th = bbox[2] - bbox[0], bbox[3] - bbox[1]
+    x = (img.width - tw) // 2
+    y = 4
+    draw.rectangle([x - 2, y - 2, x + tw + 2, y + th + 2], fill=(0, 0, 0))
+    draw.text((x, y), text, fill=(255, 255, 255), font=font)
+    return np.array(img)
+
+gif_frames = []
+for t in range(max_len):
+    panels = []
+    for fl, label in zip(all_frame_lists, labels):
+        panel = add_label(fl[t], label)
+        panels.append(panel)
+    # Resize panels to the same height if needed
+    min_h = min(p.shape[0] for p in panels)
+    resized = []
+    for p in panels:
+        if p.shape[0] != min_h:
+            pil_p = Image.fromarray(p)
+            new_w = int(p.shape[1] * min_h / p.shape[0])
+            pil_p = pil_p.resize((new_w, min_h), Image.LANCZOS)
+            p = np.array(pil_p)
+        resized.append(p)
+    concat = np.concatenate(resized, axis=1)  # side by side
+    gif_frames.append(Image.fromarray(concat))
+
+gif_path = os.path.join(output_dir, "rollout_comparison.gif")
+gif_frames[0].save(
+    gif_path,
+    save_all=True,
+    append_images=gif_frames[1:],
+    duration=100,  # 100ms per frame = 10 FPS
+    loop=0,
+)
+print(f"Saved side-by-side rollout GIF ({len(gif_frames)} frames) to {gif_path}")
+
 print("Done.")
