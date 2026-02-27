@@ -32,7 +32,7 @@ app/vjepa_droid_v4/local/
 configs/local
 
 ckpts/
-output/
+output*/
 sample_video.mp4
 ssv2_classes.json
 
