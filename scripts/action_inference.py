@@ -26,6 +26,9 @@ sys.path.insert(0, str(BASE_DIR))
 import metaworld
 from metaworld.wrappers import ProprioMultiImageObsWrapper
 
+# MetaWorld action_scale rescaling (see sawyer_xyz_env.py set_xyz_action)
+MW_ACTION_SCALE = 1.0 / 80
+
 
 def forward_target(c, normalize_reps=True):
     """
@@ -538,9 +541,9 @@ for cam_idx in range(num_cameras):
 
             # Convert 7D -> 4D Metaworld action  [dx, dy, dz, gripper]
             a7 = mpc_action[0].cpu().numpy()  # first rollout step, shape (7,)
-            action_4d = np.array(
-                [a7[0], a7[1], a7[2], a7[6]], dtype=np.float32
-            )
+            action_4d = np.zeros(4, dtype=np.float32)
+            action_4d[:3] = a7[:3] / MW_ACTION_SCALE   # meters → MW action units
+            action_4d[3]  = a7[6]                       # gripper (passthrough)
 
             # Execute in interactive environment
             obs_i, _, terminated, truncated, _ = interactive_env.step(action_4d)
