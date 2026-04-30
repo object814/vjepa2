@@ -1,14 +1,27 @@
 #!/usr/bin/env python3
 """
-MPC Evaluation Script: Expert-Guided Task Completion with V-JEPA2
+Multi-View MPC Evaluation Script: Expert-Guided Task Completion with V-JEPA2
 
-Pipeline:
+This is the multi-camera variant of mpc_eval.py. The predictor was trained with
+multiple camera views (e.g. topview, back, gripperPOV) and learnable view
+embeddings, so encoding and prediction must handle all views jointly.
+
+Key differences from single-view mpc_eval.py:
+  - Multiple cameras are encoded independently by the frozen encoder.
+  - Per-view learnable embeddings (view_embed) are loaded from the predictor
+    checkpoint and added to the encoder outputs before feeding the predictor.
+  - Tokens from all views are interleaved per-timestep before prediction:
+        [t0_view0, t0_view1, ..., t1_view0, ...]
+  - The predictor attention mask is rebuilt for the multi-view token count.
+  - tokens_per_frame = num_views * (image_size // patch_size)^2
+
+Pipeline (identical to single-view except for encoding):
   1. Create two identical Metaworld environments (expert + MPC).
   2. Roll out the expert policy, recording observation frames.
   3. Evenly sample K intermediate goal frames from the expert rollout.
-  4. Encode each goal frame into latent representations.
+  4. Encode each goal frame (all cameras) into multi-view latent representations.
   5. Run closed-loop MPC: at each step, plan an action with CEM that moves
-     the current latent representation toward the current goal representation.
+     the current multi-view latent toward the current goal representation.
   6. Switch to the next goal when the representation L1 distance drops below
      a threshold (or a per-goal step budget is exceeded).
   7. Produce a side-by-side GIF comparing expert and MPC rollouts, plus a
@@ -32,14 +45,10 @@ import matplotlib.pyplot as plt
 # ---------------------------------------------------------------------------
 # MetaWorld action-space scaling
 # ---------------------------------------------------------------------------
-# MetaWorld's `set_xyz_action` clips the incoming action to [-1, 1] and then
-# applies  pos_delta = action * action_scale  where action_scale = 1/80.
-# The CEM world model plans in *state-delta* space (meters), matching the
-# training data:  actions = states[1:] - states[:-1].
-# To convert CEM output (meters) → MetaWorld action units we divide by
-# action_scale (equivalently, multiply by 80).
 MW_ACTION_SCALE = 1.0 / 80          # MetaWorld's SawyerXYZEnv.action_scale
+
 import torch
+import torch.nn as nn
 import torch.nn.functional as F
 import gymnasium as gym
 from pathlib import Path
@@ -48,6 +57,7 @@ from PIL import Image, ImageDraw, ImageFont
 from app.vjepa_droid.transforms import make_transforms
 from app.vjepa_droid.utils import init_video_model
 from src.utils.checkpoint_loader import robust_checkpoint_loader
+from src.models.utils.modules import build_action_block_causal_attention_mask
 from utils.mpc_utils import compute_new_pose
 from utils.world_model_wrapper import WorldModel
 
@@ -164,14 +174,14 @@ def make_env(task_name, seed, camera_names, image_size, max_episode_steps=500,
 # Expert rollout
 # =====================================================================
 
-def rollout_expert(env, task_name, episode_length, camera_name, warmup_steps=5):
+def rollout_expert(env, task_name, episode_length, render_camera_name, warmup_steps=5):
     """
     Run the scripted expert policy, returning recorded data.
 
     Returns
     -------
     frames        : list[np.ndarray]  – observation images  (H, W, 3*N_cam)
-    render_frames : list[np.ndarray]  – rendered RGB frames from `camera_name`
+    render_frames : list[np.ndarray]  – rendered RGB frames from `render_camera_name`
     proprios      : list[np.ndarray]  – proprioception vectors (7,)
     rewards       : list[float]
     """
@@ -189,13 +199,13 @@ def rollout_expert(env, task_name, episode_length, camera_name, warmup_steps=5):
         obs, _, _, _, _ = env.step(np.zeros(4, dtype=np.float32))
 
     frames, render_frames, proprios, rewards = [], [], [], []
-    render_frames.append(env.render(camera_name=camera_name).copy())
+    render_frames.append(env.render(camera_name=render_camera_name).copy())
 
     for t in range(episode_length):
         action = policy.get_action(obs["original_obs"])
         obs, reward, terminated, truncated, info = env.step(action)
         frames.append(obs["image"])
-        render_frames.append(env.render(camera_name=camera_name).copy())
+        render_frames.append(env.render(camera_name=render_camera_name).copy())
         proprios.append(obs["proprio"].copy())
         rewards.append(float(reward))
         if terminated or truncated:
@@ -206,30 +216,97 @@ def rollout_expert(env, task_name, episode_length, camera_name, warmup_steps=5):
 
 
 # =====================================================================
-# MPC closed-loop controller
+# Multi-view encoding helpers
+# =====================================================================
+
+def make_multiview_encoder(encoder, transform, camera_names, view_embed,
+                           normalize_reps, device):
+    """
+    Return a function that encodes a multi-camera observation image into
+    multi-view latent representations.
+
+    The observation image is (H, W, 3*N_cam) with cameras channel-concatenated
+    in the same order as `camera_names`.
+
+    Two modes:
+      - for_predictor=True:  add view_embed before interleaving (predictor input)
+      - for_predictor=False: no view_embed (goal / comparison target)
+    """
+    num_views = len(camera_names)
+
+    def encode_single_view(image_np):
+        """Encode a single (H, W, 3) image → (1, n_patches, D)."""
+        clip = np.expand_dims(image_np, axis=0)   # (1, H, W, 3)
+        clip = transform(clip)[None, :]             # (1, C, 1, H, W)
+        B, C, T, H, W = clip.size()
+        clip = clip.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
+        clip = clip.to(device, non_blocking=True)
+        h = encoder(clip)
+        h = h.view(B, T, -1, h.size(-1))  # (1, 1, n_patches, D)
+        return h  # (1, 1, n_patches, D)
+
+    def encode_multiview(image_np, for_predictor=False):
+        """
+        Encode a multi-camera observation.
+
+        Args:
+            image_np: (H, W, 3*N_cam) uint8 array
+            for_predictor: if True, add view embeddings (for predictor input)
+                           if False, raw encoder output (for goal / loss target)
+
+        Returns:
+            h: (1, num_views * n_patches, D) — interleaved multi-view tokens
+        """
+        h_views = []
+        for cam_idx in range(num_views):
+            cam_image = image_np[:, :, 3 * cam_idx: 3 * (cam_idx + 1)]
+            h_v = encode_single_view(cam_image)  # (1, 1, n_patches, D)
+            h_views.append(h_v)
+
+        if for_predictor and view_embed is not None and num_views > 1:
+            # Add view embeddings: view_embed is (num_views, 1, D)
+            h_views_ve = [
+                hv + view_embed[i].unsqueeze(0).unsqueeze(0)  # broadcast over B, T, n_patches
+                for i, hv in enumerate(h_views)
+            ]
+            # Stack views: (1, 1, num_views, n_patches, D)
+            h = torch.stack(h_views_ve, dim=2).flatten(2, 3)  # (1, 1, num_views*n_patches, D)
+        else:
+            h = torch.stack(h_views, dim=2).flatten(2, 3)  # (1, 1, num_views*n_patches, D)
+
+        # Flatten time dim: (1, num_views*n_patches, D)
+        h = h.flatten(1, 2)
+
+        if normalize_reps:
+            h = F.layer_norm(h, (h.size(-1),))
+
+        return h
+
+    return encode_multiview
+
+
+# =====================================================================
+# MPC closed-loop controller (multi-view)
 # =====================================================================
 
 @torch.no_grad()
 def run_mpc(
     env,
     world_model,
-    encoder,
-    transform,
+    encode_fn,
     tokens_per_frame,
     goal_frames,          # list of K np.ndarray goal images (H, W, 3*N_cam)
     expert_proprios,      # list of proprios at goal timesteps (for EE logging)
     goal_timesteps,       # list of ints – expert timestep for each goal
-    cam_idx,              # which camera channel to use for encoding
-    camera_name,          # camera name for rendering
+    render_camera_name,   # camera name for rendering
     max_steps_per_goal,
     max_total_steps,
     goal_rep_threshold,
     warmup_steps,
     device,
-    normalize_reps=True,
 ):
     """
-    Closed-loop MPC using intermediate goal representations.
+    Closed-loop MPC using intermediate goal representations (multi-view).
 
     Returns
     -------
@@ -238,24 +315,10 @@ def run_mpc(
     log               : dict  (per-step analysis data)
     """
 
-    # --- Encode goal frames into latent space ---
-    def encode_image(image_np):
-        """Encode a single multi-camera observation into latent tokens."""
-        cam_image = image_np[:, :, 3 * cam_idx: 3 * (cam_idx + 1)]
-        clip = np.expand_dims(cam_image, axis=0)  # (1, H, W, 3)
-        clip = transform(clip)[None, :]            # (1, C, 1, H, W)
-        B, C, T, H, W = clip.size()
-        clip = clip.permute(0, 2, 1, 3, 4).flatten(0, 1).unsqueeze(2).repeat(1, 1, 2, 1, 1)
-        clip = clip.to(device, non_blocking=True)
-        h = encoder(clip)
-        h = h.view(B, T, -1, h.size(-1)).flatten(1, 2)
-        if normalize_reps:
-            h = F.layer_norm(h, (h.size(-1),))
-        return h  # (1, N_tokens, D)
-
-    goal_reps = [encode_image(gf) for gf in goal_frames]
+    # --- Encode goal frames (no view embeddings — these are comparison targets) ---
+    goal_reps = [encode_fn(gf, for_predictor=False) for gf in goal_frames]
     n_goals = len(goal_reps)
-    print(f"  Encoded {n_goals} goal frames into latent representations.")
+    print(f"  Encoded {n_goals} goal frames into multi-view latent representations.")
 
     # --- Reset and warm up MPC env ---
     obs, _ = env.reset()
@@ -263,7 +326,7 @@ def run_mpc(
         obs, _, _, _, _ = env.step(np.zeros(4, dtype=np.float32))
 
     # --- Tracking variables ---
-    mpc_render_frames = [env.render(camera_name=camera_name).copy()]
+    mpc_render_frames = [env.render(camera_name=render_camera_name).copy()]
     mpc_proprios = [obs["proprio"].copy()]
     step_log = []  # per-step analysis
 
@@ -277,18 +340,22 @@ def run_mpc(
           f"rep threshold={goal_rep_threshold:.4f}")
 
     while current_goal_idx < n_goals and total_steps < max_total_steps:
-        # Encode current observation
-        z_current = encode_image(obs["image"])
+        # Encode current observation (with view embeddings — predictor input)
+        z_current = encode_fn(obs["image"], for_predictor=True)
         s_current = (
             torch.from_numpy(obs["proprio"])
             .float().unsqueeze(0).unsqueeze(0).to(device)
         )
 
+        # Goal rep (no view embeddings)
         z_goal = goal_reps[current_goal_idx]
+
+        # For distance comparison, encode current without view embed too
+        z_current_raw = encode_fn(obs["image"], for_predictor=False)
 
         # Compute representation distance to current goal
         rep_dist = torch.mean(torch.abs(
-            z_current[:, :tokens_per_frame] - z_goal[:, :tokens_per_frame]
+            z_current_raw[:, :tokens_per_frame] - z_goal[:, :tokens_per_frame]
         )).item()
 
         # Compute EE position distance to expert at the goal timestep
@@ -326,6 +393,7 @@ def run_mpc(
             z_goal = goal_reps[current_goal_idx]
 
         # Plan action via CEM
+        # The world model receives z_current (with view embed) as predictor input
         mpc_action_7d = world_model.infer_next_action(
             z_current, s_current, z_goal
         )
@@ -334,18 +402,13 @@ def run_mpc(
             a7 = a7[0]
 
         # --- Action-space conversion (world-model → MetaWorld) ----------
-        # CEM output is in world-model space (delta meters, from training
-        # data where actions = state_diffs).  MetaWorld env.step() expects
-        # actions in [-1, 1] which are then scaled by action_scale (1/80).
-        # Without rescaling, a CEM output of 0.01 m would produce only
-        # 0.01 × action_scale = 0.000125 m actual displacement (80× too small).
         action_4d = np.zeros(4, dtype=np.float32)
         action_4d[:3] = a7[:3] / MW_ACTION_SCALE   # meters → MW action units
         action_4d[3]  = a7[6]                       # gripper (passthrough)
 
         # Step environment
         obs, reward, terminated, truncated, info = env.step(action_4d)
-        mpc_render_frames.append(env.render(camera_name=camera_name).copy())
+        mpc_render_frames.append(env.render(camera_name=render_camera_name).copy())
         mpc_proprios.append(obs["proprio"].copy())
 
         total_steps += 1
@@ -380,7 +443,6 @@ def run_mpc(
 def make_side_by_side_gif(expert_frames, mpc_frames, output_path, fps=15):
     """Create a GIF with expert (left) and MPC (right) side by side."""
     max_len = max(len(expert_frames), len(mpc_frames))
-    # Pad shorter sequence by repeating last frame
     while len(expert_frames) < max_len:
         expert_frames.append(expert_frames[-1].copy())
     while len(mpc_frames) < max_len:
@@ -390,7 +452,6 @@ def make_side_by_side_gif(expert_frames, mpc_frames, output_path, fps=15):
     for t in range(max_len):
         left = add_label(expert_frames[t], "Expert")
         right = add_label(mpc_frames[t], "MPC")
-        # Match heights
         min_h = min(left.shape[0], right.shape[0])
         if left.shape[0] != min_h:
             pil_l = Image.fromarray(left)
@@ -428,7 +489,6 @@ def make_trajectory_plot(expert_proprios, mpc_proprios, goal_proprios,
     ax.plot(mpc_ee[:, 0], mpc_ee[:, 1], mpc_ee[:, 2],
             "r-s", label="MPC", markersize=2, linewidth=1.5, alpha=0.7)
 
-    # Mark goals
     for i, (ge, ts) in enumerate(zip(goal_ee, goal_timesteps)):
         ax.scatter(*ge, c="gold", s=120, marker="*", zorder=5, edgecolors="k",
                    label=f"Goal {i} (t={ts})" if i < 3 else "")
@@ -439,7 +499,7 @@ def make_trajectory_plot(expert_proprios, mpc_proprios, goal_proprios,
     ax.set_xlabel("X (m)")
     ax.set_ylabel("Y (m)")
     ax.set_zlabel("Z (m)")
-    ax.set_title("EE Trajectories: Expert vs MPC")
+    ax.set_title("EE Trajectories: Expert vs MPC (Multi-View)")
     ax.legend(loc="best", fontsize=8)
     plt.tight_layout()
     plt.savefig(output_path, dpi=200, bbox_inches="tight")
@@ -456,20 +516,17 @@ def make_analysis_plot(log, output_path):
 
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(12, 10), sharex=True)
 
-    # Representation distance
     ax1.plot(steps, rep_dists, "b-", linewidth=1, label="Rep L1 distance")
     ax1.set_ylabel("Representation Distance (L1)")
-    ax1.set_title("MPC Analysis: Distances to Current Goal Over Time")
+    ax1.set_title("MPC Analysis: Distances to Current Goal Over Time (Multi-View)")
     ax1.legend()
     ax1.grid(True, alpha=0.3)
 
-    # EE distance
     ax2.plot(steps, ee_dists, "r-", linewidth=1, label="EE L2 distance (m)")
     ax2.set_ylabel("EE Distance (m)")
     ax2.legend()
     ax2.grid(True, alpha=0.3)
 
-    # Goal index
     ax3.step(steps, goal_idxs, "g-", linewidth=2, where="post", label="Current goal index")
     ax3.set_ylabel("Goal Index")
     ax3.set_xlabel("MPC Step")
@@ -488,7 +545,7 @@ def make_analysis_plot(log, output_path):
 
 def parse_args():
     p = argparse.ArgumentParser(
-        description="V-JEPA2 MPC Evaluation: follow expert demonstrations"
+        description="V-JEPA2 Multi-View MPC Evaluation: follow expert demonstrations"
     )
     # --- Task ---
     p.add_argument("--task", type=str, default="pick-place-v3",
@@ -498,15 +555,17 @@ def parse_args():
                    help="Expert episode length (number of env steps)")
     p.add_argument("--seed", type=int, default=42,
                    help="Random seed for reproducible environments")
-    p.add_argument("--camera-name", type=str, default="front",
-                   help="Camera name for observations and rendering")
+    p.add_argument("--camera-names", nargs="+", default=["topview", "back", "gripperPOV"],
+                   help="Camera names for multi-view observations (order must match training)")
+    p.add_argument("--render-camera", type=str, default="front",
+                   help="Camera name for rendering output GIFs (can differ from obs cameras)")
     p.add_argument("--image-size", type=int, default=224,
                    help="Observation image size (square, in pixels)")
     p.add_argument("--env-kwargs", nargs="*", default=[],
                    help="Extra env kwargs as key=value (e.g. initialise_region=fixed)")
 
     # --- Model ---
-    p.add_argument("--model", type=str, default="giant",
+    p.add_argument("--model", type=str, default="large",
                    choices=["giant", "large"],
                    help="Encoder backbone size")
     p.add_argument("--encoder-ckpt", type=str, default=None,
@@ -519,61 +578,37 @@ def parse_args():
                    help="Number of intermediate goal frames to sample from expert rollout")
 
     # --- MPC / CEM ---
-    # Paper reference: V-JEPA 2 (arxiv:2506.09985), Section 4.1, 4.2, 11.2, Table 3.
-    # The paper uses: 800 samples, 10 refinement steps, top-10 elites,
-    # planning horizon 1, actions constrained to L1-ball of radius 0.075.
     p.add_argument("--mpc-rollout", type=int, default=1,
-                   help="CEM planning horizon (steps ahead to simulate). "
-                        "Paper §11.2: horizon=1 ('short planning horizon sufficient').")
+                   help="CEM planning horizon (steps ahead to simulate)")
     p.add_argument("--mpc-rollout-parallel", type=int, default=None,
-                   help="Max CEM samples to process in parallel on GPU. "
-                        "Controls peak VRAM usage. When set lower than "
-                        "--mpc-samples, samples are processed in mini-batches "
-                        "of this size (trading time for memory). "
-                        "Default: same as --mpc-samples (all at once).")
+                   help="Max CEM samples to process in parallel on GPU")
     p.add_argument("--mpc-samples", type=int, default=800,
-                   help="CEM: action trajectories sampled per iteration. "
-                        "Paper §11.2/Table 3: 800 samples (16 sec/action on RTX 4090).")
+                   help="CEM: action trajectories sampled per iteration")
     p.add_argument("--mpc-topk", type=int, default=10,
-                   help="CEM: elite samples to fit the next distribution. "
-                        "Paper §11.2: top 10.")
+                   help="CEM: elite samples to fit the next distribution")
     p.add_argument("--mpc-cem-steps", type=int, default=10,
-                   help="CEM: optimization / refinement iterations per action. "
-                        "Paper §11.2/Table 3: 10 refinement steps.")
+                   help="CEM: optimization / refinement iterations per action")
     p.add_argument("--mpc-momentum-mean", type=float, default=0.1,
-                   help="CEM: momentum for mean update (xyz). "
-                        "Paper uses standard CEM (full elite replacement → 0.0). "
-                        "Small momentum (0.1) adds smoothing for sim stability.")
+                   help="CEM: momentum for mean update (xyz)")
     p.add_argument("--mpc-momentum-mean-gripper", type=float, default=0.1,
                    help="CEM: momentum for mean update (gripper)")
     p.add_argument("--mpc-momentum-std", type=float, default=0.5,
-                   help="CEM: momentum for std update (xyz). "
-                        "Paper uses standard CEM. "
-                        "Moderate momentum prevents premature std collapse in sim.")
+                   help="CEM: momentum for std update (xyz)")
     p.add_argument("--mpc-momentum-std-gripper", type=float, default=0.1,
                    help="CEM: momentum for std update (gripper)")
     p.add_argument("--mpc-maxnorm", type=float, default=0.0125,
-                   help="CEM: per-axis action magnitude clip (in meters, world-model space). "
-                        "Paper §4.1 uses 0.075 for Droid (real Franka). "
-                        "For MetaWorld, set to match action_scale = 1/80 = 0.0125 m, "
-                        "so CEM-planned actions stay within the env's executable range "
-                        "(mw_action = cem_xyz / action_scale ∈ [-1, 1]).")
+                   help="CEM: per-axis action magnitude clip (meters, world-model space)")
 
     # --- Goal switching ---
-    # Paper §4.2/§11.2: pick-and-place uses fixed step counts per sub-goal
-    # (4 steps for grasp goal, 10 steps for transport goal, 4 steps for place goal).
-    # We use representation-distance based switching with a hard step budget fallback.
     p.add_argument("--goal-rep-threshold", type=float, default=0.3,
-                   help="Representation L1 distance threshold to switch goals. "
-                        "Lower → more precise matching before switching.")
+                   help="Representation L1 distance threshold to switch goals")
     p.add_argument("--max-steps-per-goal", type=int, default=25,
-                   help="Max MPC steps per goal. Paper uses 4-10 steps per sub-goal "
-                        "on real Franka at 4fps. Sim may need more steps.")
+                   help="Max MPC steps per goal")
     p.add_argument("--max-total-steps", type=int, default=200,
                    help="Maximum total MPC steps across all goals")
 
     # --- Output ---
-    p.add_argument("--output-dir", type=str, default="./output_mpc_eval",
+    p.add_argument("--output-dir", type=str, default="./output_mpc_eval_multiview",
                    help="Directory for output files")
     p.add_argument("--gif-fps", type=int, default=15,
                    help="Frames per second for output GIFs")
@@ -583,6 +618,8 @@ def parse_args():
 
 def main():
     args = parse_args()
+
+    num_views = len(args.camera_names)
 
     # --- Model config ---
     MODEL_CONFIGS = {
@@ -597,7 +634,7 @@ def main():
         "large": {
             "model_name": "vit_large",
             "encoder_ckpt": "/Metaworld/third_party/vjepa2/ckpts/vitl.pt",
-            "predictor_ckpt": "/Metaworld/third_party/vjepa2/train/metaworld_pickplace_vitl_0225/e300.pt",
+            "predictor_ckpt": "/Metaworld/third_party/vjepa2/train/metaworld_pickplace_vitl_multiview/latest.pt",
             "pred_depth": 12,
             "pred_num_heads": 12,
             "pred_embed_dim": 384,
@@ -607,7 +644,6 @@ def main():
     encoder_ckpt = args.encoder_ckpt or mcfg["encoder_ckpt"]
     predictor_ckpt = args.predictor_ckpt or mcfg["predictor_ckpt"]
     DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
-    camera_names = [args.camera_name]
 
     os.makedirs(args.output_dir, exist_ok=True)
 
@@ -619,13 +655,19 @@ def main():
         k, v = kv.split("=", 1)
         env_kwargs[k] = v
 
+    # --- Compute token counts ---
+    single_view_tokens = int((args.image_size // 16) ** 2)  # patch_size=16
+    tokens_per_frame = num_views * single_view_tokens
+
     print("=" * 60)
-    print("V-JEPA2  MPC  EVALUATION")
+    print("V-JEPA2  MULTI-VIEW  MPC  EVALUATION")
     print("=" * 60)
     print(f"  Task:            {args.task}")
     print(f"  Model:           {args.model} ({mcfg['model_name']})")
     print(f"  Device:          {DEVICE}")
-    print(f"  Camera:          {args.camera_name}")
+    print(f"  Camera views:    {args.camera_names} ({num_views} views)")
+    print(f"  Render camera:   {args.render_camera}")
+    print(f"  Tokens/frame:    {tokens_per_frame} ({num_views} views × {single_view_tokens} patches)")
     print(f"  Expert length:   {args.episode_length}")
     print(f"  N goals:         {args.n_goals}")
     print(f"  Max steps/goal:  {args.max_steps_per_goal}")
@@ -641,7 +683,7 @@ def main():
     # =================================================================
     # 1. Load V-JEPA2 model
     # =================================================================
-    print("\n[1/5] Loading V-JEPA2 encoder + predictor...")
+    print("\n[1/6] Loading V-JEPA2 encoder + predictor...")
 
     encoder, predictor = init_video_model(
         device=DEVICE,
@@ -678,18 +720,94 @@ def main():
 
     encoder = encoder.to(DEVICE).eval()
     predictor = predictor.to(DEVICE).eval()
-    tokens_per_frame = int((args.image_size // encoder.patch_size) ** 2)
+
+    # =================================================================
+    # 2. Load view embeddings & rebuild predictor attention mask
+    # =================================================================
+    print("\n[2/6] Setting up multi-view: loading view_embed & rebuilding attention mask...")
+
+    # Load view_embed from the predictor checkpoint
+    pred_checkpoint = robust_checkpoint_loader(predictor_ckpt, map_location=torch.device("cpu"))
+    view_embed = None
+    if "view_embed" in pred_checkpoint:
+        ckpt_ve = pred_checkpoint["view_embed"]  # (N_ckpt, 1, D)
+        ckpt_camera_views = pred_checkpoint.get("camera_views", None)
+        if ckpt_camera_views is not None:
+            # Name-based matching: reorder checkpoint view_embed to match --camera-names
+            ckpt_view_to_idx = {name: i for i, name in enumerate(ckpt_camera_views)}
+            reordered = []
+            for name in args.camera_names:
+                if name not in ckpt_view_to_idx:
+                    raise ValueError(
+                        f"Camera '{name}' not found in checkpoint's camera_views "
+                        f"{ckpt_camera_views}. Cannot load view_embed."
+                    )
+                reordered.append(ckpt_ve[ckpt_view_to_idx[name]])
+            view_embed = torch.stack(reordered, dim=0).to(DEVICE)
+            print(f"  Loaded view_embed by name: checkpoint cameras={ckpt_camera_views}, "
+                  f"inference cameras={args.camera_names}, shape={view_embed.shape}")
+        else:
+            # Legacy checkpoint without camera_views metadata — use positional order
+            assert ckpt_ve.shape[0] == num_views, (
+                f"view_embed has {ckpt_ve.shape[0]} views but {num_views} cameras specified, "
+                f"and checkpoint has no camera_views metadata to match by name"
+            )
+            view_embed = ckpt_ve.to(DEVICE)
+            print(f"  Loaded view_embed (positional, no camera_views in ckpt): "
+                  f"shape={view_embed.shape}, device={DEVICE}")
+        del ckpt_ve
+    else:
+        print("  WARNING: No view_embed found in predictor checkpoint. "
+              "Proceeding without view embeddings.")
+    del pred_checkpoint
+
+    # Rebuild predictor attention mask for multi-view token count.
+    # The predictor was trained with grid_height = orig_gh * num_views
+    # (see train.py multi-view setup).
+    orig_gh = predictor.grid_height
+    if num_views > 1:
+        # Use a small grid_depth for the mask (we only need 2-3 frames in MPC)
+        # to avoid huge memory allocation. The mask is causal so this is fine
+        # as long as grid_depth >= frames we'll use (context + rollout).
+        mpc_grid_depth = 8  # generous for MPC use
+        use_extrinsics = False
+        add_tokens = 3 if use_extrinsics else 2
+
+        predictor.grid_height = orig_gh * num_views
+        mv_attn_mask = build_action_block_causal_attention_mask(
+            mpc_grid_depth,
+            predictor.grid_height,
+            predictor.grid_width,
+            add_tokens=add_tokens,
+        )
+        predictor.attn_mask = mv_attn_mask
+        print(f"  Rebuilt predictor attention mask for multi-view: "
+              f"grid_height {orig_gh} → {predictor.grid_height}, "
+              f"grid_depth={mpc_grid_depth}, mask shape={mv_attn_mask.shape}")
+    else:
+        print("  Single view — no attention mask rebuild needed.")
 
     transform = make_transforms(
         random_horizontal_flip=False,
-        random_resize_aspect_ratio=(1., 1.),
-        random_resize_scale=(1., 1.),
+        random_resize_aspect_ratio=(0.75, 1.35),
+        random_resize_scale=(1.777, 1.777),
         reprob=0.,
         auto_augment=False,
         motion_shift=False,
         crop_size=args.image_size,
     )
 
+    # Build multi-view encoder function
+    encode_fn = make_multiview_encoder(
+        encoder=encoder,
+        transform=transform,
+        camera_names=args.camera_names,
+        view_embed=view_embed,
+        normalize_reps=True,
+        device=DEVICE,
+    )
+
+    # Build world model (tokens_per_frame is now multi-view)
     world_model = WorldModel(
         encoder=encoder,
         predictor=predictor,
@@ -714,17 +832,17 @@ def main():
     print("  Model loaded.\n")
 
     # =================================================================
-    # 2. Expert rollout
+    # 3. Expert rollout
     # =================================================================
-    print("[2/5] Running expert rollout...")
+    print("[3/6] Running expert rollout...")
 
     expert_env = make_env(
-        args.task, args.seed, camera_names, args.image_size,
+        args.task, args.seed, args.camera_names, args.image_size,
         max_episode_steps=args.episode_length + 20,
         env_kwargs=env_kwargs,
     )
     expert_frames, expert_render_frames, expert_proprios, expert_rewards = rollout_expert(
-        expert_env, args.task, args.episode_length, args.camera_name
+        expert_env, args.task, args.episode_length, args.render_camera
     )
     expert_env.close()
 
@@ -732,17 +850,15 @@ def main():
     print(f"  Expert rollout done: {actual_len} steps.\n")
 
     # =================================================================
-    # 3. Sample intermediate goal frames
+    # 4. Sample intermediate goal frames
     # =================================================================
-    print("[3/5] Sampling intermediate goal frames...")
+    print("[4/6] Sampling intermediate goal frames...")
 
     n_goals = min(args.n_goals, actual_len)
-    # Evenly spaced indices: e.g. for 200 steps and 5 goals → steps 40,80,120,160,200
     goal_step_indices = [
         int(round((i + 1) * actual_len / n_goals)) - 1
         for i in range(n_goals)
     ]
-    # Ensure last goal is the final frame
     goal_step_indices[-1] = actual_len - 1
 
     goal_frames = [expert_frames[idx] for idx in goal_step_indices]
@@ -753,11 +869,10 @@ def main():
         print(f"  Goal {i}: expert step {idx:4d} | "
               f"EE=({ee[0]:.4f}, {ee[1]:.4f}, {ee[2]:.4f})")
 
-    # Save goal frame images for reference
+    # Save goal frame images for reference (first camera only)
     goal_img_dir = os.path.join(args.output_dir, "goal_frames")
     os.makedirs(goal_img_dir, exist_ok=True)
     for i, gf in enumerate(goal_frames):
-        # Take just the first camera's channels for saving
         cam_img = gf[:, :, :3]
         Image.fromarray(cam_img).save(
             os.path.join(goal_img_dir, f"goal_{i}_step{goal_step_indices[i]:04d}.png")
@@ -765,12 +880,12 @@ def main():
     print()
 
     # =================================================================
-    # 4. MPC closed-loop rollout
+    # 5. MPC closed-loop rollout
     # =================================================================
-    print("[4/5] Running MPC closed-loop rollout...")
+    print("[5/6] Running MPC closed-loop rollout (multi-view)...")
 
     mpc_env = make_env(
-        args.task, args.seed, camera_names, args.image_size,
+        args.task, args.seed, args.camera_names, args.image_size,
         max_episode_steps=args.max_total_steps + 20,
         env_kwargs=env_kwargs,
     )
@@ -778,14 +893,12 @@ def main():
     mpc_render_frames, mpc_proprios, mpc_log = run_mpc(
         env=mpc_env,
         world_model=world_model,
-        encoder=encoder,
-        transform=transform,
+        encode_fn=encode_fn,
         tokens_per_frame=tokens_per_frame,
         goal_frames=goal_frames,
         expert_proprios=goal_proprios,
         goal_timesteps=goal_step_indices,
-        cam_idx=0,
-        camera_name=args.camera_name,
+        render_camera_name=args.render_camera,
         max_steps_per_goal=args.max_steps_per_goal,
         max_total_steps=args.max_total_steps,
         goal_rep_threshold=args.goal_rep_threshold,
@@ -796,9 +909,9 @@ def main():
     print()
 
     # =================================================================
-    # 5. Visualisation & analysis
+    # 6. Visualisation & analysis
     # =================================================================
-    print("[5/5] Generating visualisations...")
+    print("[6/6] Generating visualisations...")
 
     # Side-by-side GIF
     gif_path = os.path.join(args.output_dir, "expert_vs_mpc.gif")
@@ -816,7 +929,7 @@ def main():
         goal_step_indices, traj_path
     )
 
-    # Analysis plot (rep distance & EE distance over time)
+    # Analysis plot
     analysis_path = os.path.join(args.output_dir, "mpc_analysis.png")
     make_analysis_plot(mpc_log, analysis_path)
 
@@ -828,9 +941,10 @@ def main():
 
     # Summary
     print("\n" + "=" * 60)
-    print("EVALUATION SUMMARY")
+    print("EVALUATION SUMMARY (MULTI-VIEW)")
     print("=" * 60)
     print(f"  Task:              {args.task}")
+    print(f"  Camera views:      {args.camera_names}")
     print(f"  Expert steps:      {actual_len}")
     print(f"  MPC total steps:   {mpc_log['total_steps']}")
     print(f"  Goals reached:     {mpc_log['goals_reached']}/{mpc_log['n_goals']}")

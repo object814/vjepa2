@@ -4,7 +4,6 @@
 # LICENSE file in the root directory of this source tree.
 
 import numpy as np
-import torch
 import torch.nn.functional as F
 
 from .mpc_utils import cem, compute_new_pose
@@ -19,19 +18,16 @@ class WorldModel(object):
         tokens_per_frame,
         transform,
         mpc_args={
-            # jepa-wms MetaWorld defaults (Terver et al. 2025, Table S4.1):
-            # N=300, K=10, J=15, H=6, m=3, Wp=2
-            "rollout": 3,
-            "samples": 300,
+            "rollout": 2,
+            "samples": 400,
             "topk": 10,
-            "cem_steps": 15,
-            "momentum_mean": 0.0,
-            "momentum_std": 0.0,
-            "maxnorm": 0.0125,
+            "cem_steps": 10,
+            "momentum_mean": 0.15,
+            "momentum_std": 0.15,
+            "maxnorm": 0.05,
             "verbose": True,
         },
         normalize_reps=True,
-        cost_type="l2",  # "l1" or "l2" — jepa-wms found L2 consistently better
         device="cuda:0",
     ):
         super().__init__()
@@ -42,7 +38,6 @@ class WorldModel(object):
         self.tokens_per_frame = tokens_per_frame
         self.device = device
         self.mpc_args = mpc_args
-        self.cost_type = cost_type
 
     def encode(self, image):
         clip = np.expand_dims(image, axis=0)
@@ -57,8 +52,6 @@ class WorldModel(object):
         return h
 
     def infer_next_action(self, rep, pose, goal_rep, close_gripper=None):
-
-        cost_type = self.cost_type
 
         def step_predictor(reps, actions, poses):
             B, T, N_T, D = reps.size()

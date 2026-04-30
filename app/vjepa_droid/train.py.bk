@@ -561,16 +561,10 @@ def main(args, resume_preempt=False):
                     z_tf = _step_predictor(_z, _a, _s, _e)
 
                     # -- full auto-regressive rollouts of predictor
-                    # jepa-wms finding: detach intermediate predictions (TBPTT)
-                    # to prevent gradient explosion and improve training stability.
-                    # (Terver et al. 2025, Appendix B: "we find simultaneously
-                    # beneficial in terms of success rate and training time to
-                    # perform TBTT, detaching the gradient on all inputs before
-                    # each pass in the predictor.")
-                    _z = torch.cat([z[:, : tokens_per_frame], z_tf[:, : tokens_per_frame].detach()], dim=1)
+                    _z = torch.cat([z[:, : tokens_per_frame], z_tf[:, : tokens_per_frame]], dim=1)
                     for n in range(1, auto_steps):
                         _a, _s, _e = actions[:, : n + 1], states[:, : n + 1], extrinsics[:, : n + 1]
-                        _z_nxt = _step_predictor(_z.detach(), _a, _s, _e)[:, -tokens_per_frame:]
+                        _z_nxt = _step_predictor(_z, _a, _s, _e)[:, -tokens_per_frame:]
                         _z = torch.cat([_z, _z_nxt], dim=1)
                     z_ar = _z[:, tokens_per_frame:]
 

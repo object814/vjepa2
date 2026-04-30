@@ -146,7 +146,7 @@ MODEL_CONFIGS = {
     "large": {
         "model_name": "vit_large",
         "encoder_ckpt": "/Metaworld/third_party/vjepa2/ckpts/vitl.pt",
-        "predictor_ckpt": "/Metaworld/third_party/vjepa2/train/metaworld_pickplace_vitl_0225/e300.pt",
+        "predictor_ckpt": "/Metaworld/third_party/vjepa2/train/metaworld_pickplace_vitl_corner_0304/latest.pt",
         "pred_depth": 12,
         "pred_num_heads": 12,
         "pred_embed_dim": 384,
@@ -161,7 +161,7 @@ T = 40
 DEVICE = "cuda" if torch.cuda.is_available() else "cpu"
 NSAMPLES = 5
 GRID_SIZE = 0.075
-camera_names = ["front"]
+camera_names = ["corner"]
 
 ENCODER_CKPT = MCFG["encoder_ckpt"]
 PREDICTOR_CKPT = MCFG["predictor_ckpt"]

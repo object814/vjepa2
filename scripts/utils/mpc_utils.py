@@ -37,6 +37,7 @@ def cem(
     momentum_mean_gripper=0.15,
     momentum_std_gripper=0.15,
     samples=100,
+    samples_parallel=None,
     topk=10,
     verbose=False,
     maxnorm=0.05,
@@ -48,6 +49,10 @@ def cem(
     :param context_frame: [B=1, T=1, HW, D]
     :param goal_frame: [B=1, T=1, HW, D]
     :param world_model: f(context_frame, action) -> next_frame [B, 1, HW, D]
+    :param samples_parallel: Max samples to process in parallel on GPU. If None
+        or >= samples, all samples run at once (original behaviour). Otherwise
+        samples are processed in mini-batches of this size to limit VRAM, at
+        the cost of proportionally more time.
     :return: [B=1, rollout, 7] an action trajectory over rollout horizon
 
     Cross-Entropy Method
@@ -59,6 +64,9 @@ def cem(
     4. select topk samples and update mean and std using topk action trajs
     5. choose final action to be mean of distribution
     """
+    if samples_parallel is None or samples_parallel >= samples:
+        samples_parallel = samples
+
     context_frame = context_frame.repeat(samples, 1, 1, 1)  # Reshape to [S, 1, HW, D]
     goal_frame = goal_frame.repeat(samples, 1, 1, 1)  # Reshape to [S, 1, HW, D]
     context_pose = context_pose.repeat(samples, 1, 1)  # Reshape to [S, 1, 7]
@@ -83,14 +91,14 @@ def cem(
     for ax in axis.keys():
         mean[:, ax] = axis[ax]
 
-    def sample_action_traj():
-        """Sample several action trajectories"""
-        action_traj, frame_traj, pose_traj = None, context_frame, context_pose
+    def sample_action_traj_chunk(ctx_frame_chunk, ctx_pose_chunk, chunk_size):
+        """Sample action trajectories for a chunk of samples."""
+        action_traj, frame_traj, pose_traj = None, ctx_frame_chunk, ctx_pose_chunk
 
         for h in range(rollout):
 
             # -- sample new action
-            action_samples = torch.randn(samples, mean.size(1), device=mean.device) * std[h] + mean[h]
+            action_samples = torch.randn(chunk_size, mean.size(1), device=mean.device) * std[h] + mean[h]
             action_samples[:, :3] = torch.clip(action_samples[:, :3], min=-maxnorm, max=maxnorm)
             action_samples[:, -1:] = torch.clip(action_samples[:, -1:], min=-0.75, max=0.75)
             for ax in axis.keys():
@@ -117,6 +125,25 @@ def cem(
 
         return action_traj, frame_traj
 
+    def sample_action_traj():
+        """Sample action trajectories, processing in mini-batches if needed."""
+        if samples_parallel >= samples:
+            return sample_action_traj_chunk(context_frame, context_pose, samples)
+
+        all_action_trajs = []
+        all_final_frames = []
+        for start in range(0, samples, samples_parallel):
+            end = min(start + samples_parallel, samples)
+            chunk_size = end - start
+            chunk_action, chunk_frame = sample_action_traj_chunk(
+                context_frame[start:end],
+                context_pose[start:end],
+                chunk_size,
+            )
+            all_action_trajs.append(chunk_action)
+            all_final_frames.append(chunk_frame[:, -1])  # only keep final state
+        return torch.cat(all_action_trajs, dim=0), torch.cat(all_final_frames, dim=0)
+
     def select_topk_action_traj(final_state, goal_state, actions):
         """Get the topk action trajectories that bring us closest to goal"""
         sims = objective(final_state.flatten(1), goal_state.flatten(1))
@@ -125,9 +152,15 @@ def cem(
         return selected_actions
 
     for step in tqdm(range(cem_steps), disable=True):
-        action_traj, frame_traj = sample_action_traj()
+        action_traj_result, frame_traj_result = sample_action_traj()
+        # When mini-batching, frame_traj_result is already just the final frames [S, HW, D]
+        # When not mini-batching, it's the full trajectory [S, T, HW, D] — take last frame
+        if frame_traj_result.dim() == 4:
+            final_frames = frame_traj_result[:, -1]
+        else:
+            final_frames = frame_traj_result
         selected_actions = select_topk_action_traj(
-            final_state=frame_traj[:, -1], goal_state=goal_frame, actions=action_traj
+            final_state=final_frames, goal_state=goal_frame, actions=action_traj_result
         )
         mean_selected_actions = selected_actions.mean(dim=0)
         std_selected_actions = selected_actions.std(dim=0)

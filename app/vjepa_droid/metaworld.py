@@ -22,15 +22,26 @@ Dataset layout (on disk):
             recordings/MP4/<camera>.mp4
         ...
 
-__getitem__ returns the same 5-tuple as DROIDVideoDataset:
-    (buffer, actions, states, extrinsics, indices)
-where
-    buffer     - (C, T, H, W) float tensor  [after transform]
-                 or (T, H, W, 3) uint8 ndarray [without transform]
-    actions    - (T-1, 7) float32 ndarray
-    states     - (T, 7) float32 ndarray
-    extrinsics - (T, 7) float32 ndarray
-    indices    - (T,) int64 ndarray       (frame indices within the episode)
+Single-view mode (multiview=False, default):
+    __getitem__ returns the same 5-tuple as DROIDVideoDataset:
+        (buffer, actions, states, extrinsics, indices)
+    where
+        buffer     - (C, T, H, W) float tensor  [after transform]
+                     or (T, H, W, 3) uint8 ndarray [without transform]
+        actions    - (T-1, 7) float32 ndarray
+        states     - (T, 7) float32 ndarray
+        extrinsics - (T, 7) float32 ndarray
+        indices    - (T,) int64 ndarray       (frame indices within the episode)
+
+Multi-view mode (multiview=True):
+    __getitem__ returns a 5-tuple:
+        (buffers, actions, states, extrinsics, indices)
+    where
+        buffers    - list of N (C, T, H, W) float tensors, one per camera view
+        actions    - (T-1, 7) float32 ndarray
+        states     - (T, 7) float32 ndarray
+        extrinsics - (T, 7) float32 ndarray   (from the first camera)
+        indices    - (T,) int64 ndarray
 """
 
 import json
@@ -71,6 +82,7 @@ def init_data(
     transform=None,
     camera_frame=False,
     tubelet_size=2,
+    multiview=False,
 ):
     """Create a MetaworldVideoDataset and a DataLoader (same API as droid.init_data).
 
@@ -78,7 +90,12 @@ def init_data(
         data_path:        Path to ``episodes.csv``.
         camera_views:     List of camera name strings that exist in the dataset
                           (e.g. ``["topview", "front", "gripperPOV"]``).
-                          One is randomly selected per sample.
+                          When ``multiview=False`` (default), one is randomly
+                          selected per sample (original behaviour).
+                          When ``multiview=True``, *all* cameras are loaded and
+                          returned as a list of tensors.
+        multiview:        If True, load all camera views per sample instead of
+                          randomly picking one.
         (all other args): Identical semantics to ``droid.init_data``.
     """
     if camera_views is None:
@@ -91,11 +108,16 @@ def init_data(
         fps=fps,
         camera_views=camera_views,
         frameskip=tubelet_size,
+        multiview=multiview,
     )
 
     dist_sampler = torch.utils.data.distributed.DistributedSampler(
         dataset, num_replicas=world_size, rank=rank, shuffle=True
     )
+
+    # Use multiview collator when loading all camera views
+    if multiview and collator is None:
+        collator = multiview_collate
 
     data_loader = torch.utils.data.DataLoader(
         dataset,
@@ -110,6 +132,31 @@ def init_data(
 
     logger.info("MetaworldVideoDataset data loader created")
     return data_loader, dist_sampler
+
+
+def multiview_collate(batch):
+    """Custom collate for multi-view samples.
+
+    Each sample is (buffers_list, actions, states, extrinsics, indices) where
+    buffers_list is a list of N camera tensors each shaped (C, T, H, W).
+
+    Returns:
+        clips_list: list of N tensors each (B, C, T, H, W)
+        actions:    (B, T-1, 7)
+        states:     (B, T, 7)
+        extrinsics: (B, T, 7)
+        indices:    (B, T)
+    """
+    buffers_lists, actions, states, extrinsics, indices = zip(*batch)
+    num_views = len(buffers_lists[0])
+    clips_list = []
+    for v in range(num_views):
+        clips_list.append(torch.stack([b[v] for b in buffers_lists], dim=0))
+    actions = torch.utils.data.default_collate(actions)
+    states = torch.utils.data.default_collate(states)
+    extrinsics = torch.utils.data.default_collate(extrinsics)
+    indices = torch.utils.data.default_collate(indices)
+    return clips_list, actions, states, extrinsics, indices
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -139,6 +186,7 @@ class MetaworldVideoDataset(torch.utils.data.Dataset):
         frames_per_clip: int = 16,
         fps: int | None = 5,
         transform=None,
+        multiview: bool = False,
     ):
         """
         Args:
@@ -150,12 +198,15 @@ class MetaworldVideoDataset(torch.utils.data.Dataset):
             fps:             Target frames-per-second to sample from the video.
                              ``None`` means use the video's native fps.
             transform:       Video transform (e.g. ``make_transforms``).
+            multiview:       If True, load all camera views per sample instead
+                             of randomly picking one.
         """
         self.data_path = data_path
         self.frames_per_clip = frames_per_clip
         self.frameskip = frameskip
         self.fps = fps
         self.transform = transform
+        self.multiview = multiview
 
         if camera_views is None:
             camera_views = ["topview"]
@@ -194,17 +245,20 @@ class MetaworldVideoDataset(torch.utils.data.Dataset):
         traj_path = os.path.join(path, self.h5_name)
         traj = h5py.File(traj_path, "r")
 
-        # ── randomly pick a camera view ──────────────────────────────────
-        cam_idx = torch.randint(0, len(self.camera_views), (1,)).item()
-        camera_name = self.camera_views[cam_idx]
-
         # ── states  (T_full, 7) ──────────────────────────────────────────
         cart_pos = np.array(traj["observation"]["robot_state"]["cartesian_position"])  # (T, 6)
         grip_pos = np.array(traj["observation"]["robot_state"]["gripper_position"])    # (T,)
         states_full = np.concatenate([cart_pos, grip_pos[:, None]], axis=1).astype(np.float32)  # (T, 7)
 
-        # ── extrinsics  (T_full, 7) ──────────────────────────────────────
-        ext_key = camera_name
+        # ── determine which cameras to load ──────────────────────────────
+        if self.multiview:
+            cam_names = self.camera_views  # load all
+        else:
+            cam_idx = torch.randint(0, len(self.camera_views), (1,)).item()
+            cam_names = [self.camera_views[cam_idx]]
+
+        # ── extrinsics  (T_full, 7) — from first camera ─────────────────
+        ext_key = cam_names[0]
         if ext_key in traj["observation"]["camera_extrinsics"]:
             extrinsics_full = np.array(
                 traj["observation"]["camera_extrinsics"][ext_key]
@@ -212,25 +266,25 @@ class MetaworldVideoDataset(torch.utils.data.Dataset):
         else:
             extrinsics_full = np.zeros_like(states_full)
 
-        # ── video ────────────────────────────────────────────────────────
-        mp4_rel = metadata.get(camera_name)
-        if mp4_rel is None:
-            raise RuntimeError(f"Camera '{camera_name}' not found in metadata at {path}")
-        vpath = os.path.join(path, mp4_rel)
-        vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
-        vfps = vr.get_avg_fps()
+        # ── video: compute shared frame indices from the first camera ────
+        first_mp4_rel = metadata.get(cam_names[0])
+        if first_mp4_rel is None:
+            raise RuntimeError(f"Camera '{cam_names[0]}' not found in metadata at {path}")
+        first_vpath = os.path.join(path, first_mp4_rel)
+        vr0 = VideoReader(first_vpath, num_threads=-1, ctx=cpu(0))
+        vfps = vr0.get_avg_fps()
         fpc = self.frames_per_clip
         target_fps = self.fps if self.fps is not None else vfps
         fstp = max(1, ceil(vfps / target_fps))
         nframes = int(fpc * fstp)
-        vlen = len(vr)
+        vlen = len(vr0)
 
         if vlen < nframes:
             raise RuntimeError(
-                f"Video too short: {vpath} has {vlen} frames, need {nframes}"
+                f"Video too short: {first_vpath} has {vlen} frames, need {nframes}"
             )
 
-        # random window
+        # random window (shared across all cameras)
         ef = np.random.randint(nframes, vlen)
         sf = ef - nframes
         indices = np.arange(sf, sf + nframes, fstp).astype(np.int64)
@@ -242,15 +296,26 @@ class MetaworldVideoDataset(torch.utils.data.Dataset):
         # ── actions as state diffs (T-1, 7) ──────────────────────────────
         actions = states[1:] - states[:-1]
 
-        # ── video frames ─────────────────────────────────────────────────
-        vr.seek(0)
-        buffer = vr.get_batch(indices).asnumpy()  # (T, H, W, 3) uint8
-
-        if self.transform is not None:
-            buffer = self.transform(buffer)
+        # ── load video frames for each camera ────────────────────────────
+        buffers = []
+        for cam_name in cam_names:
+            mp4_rel = metadata.get(cam_name)
+            if mp4_rel is None:
+                raise RuntimeError(f"Camera '{cam_name}' not found in metadata at {path}")
+            vpath = os.path.join(path, mp4_rel)
+            vr = VideoReader(vpath, num_threads=-1, ctx=cpu(0))
+            vr.seek(0)
+            buf = vr.get_batch(indices).asnumpy()  # (T, H, W, 3) uint8
+            if self.transform is not None:
+                buf = self.transform(buf)
+            buffers.append(buf)
 
         traj.close()
-        return buffer, actions, states, extrinsics, indices
+
+        if self.multiview:
+            return buffers, actions, states, extrinsics, indices
+        else:
+            return buffers[0], actions, states, extrinsics, indices
 
     def __len__(self):
         return len(self.samples)

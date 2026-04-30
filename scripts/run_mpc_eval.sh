@@ -38,7 +38,7 @@ EPISODE_LENGTH=200
 SEED=42
 
 # Camera for observations AND rendered GIF frames.
-CAMERA_NAME="front"
+CAMERA_NAME="corner"
 
 # Observation image size (square). Must match the model's expected input.
 IMAGE_SIZE=224
@@ -52,11 +52,11 @@ ENV_KWARGS="initialise_region=fixed"
 # MODEL CONFIGURATION
 # ──────────────────────────────────────────────────────────────────────
 # Encoder backbone: "giant" (ViT-G, ~1B params) or "large" (ViT-L, ~300M).
-MODEL="giant"
+MODEL="large"
 
 # Override checkpoint paths (leave empty to use defaults for the chosen model).
-ENCODER_CKPT=""
-PREDICTOR_CKPT=""
+ENCODER_CKPT="/Metaworld/third_party/vjepa2/ckpts/vitl.pt"
+PREDICTOR_CKPT="/Metaworld/third_party/vjepa2/train/metaworld_pickplace_vitl_corner_0304/latest.pt"
 
 # ──────────────────────────────────────────────────────────────────────
 # INTERMEDIATE GOAL CONFIGURATION
@@ -84,7 +84,7 @@ N_GOALS=5
 # --- Planning horizon ---
 # Paper §11.2: "Since all considered tasks are relatively greedy, we found
 #   a short planning horizon to be sufficient for our setup."
-MPC_ROLLOUT=1
+MPC_ROLLOUT=2
 
 # --- Sampling ---
 # Paper §11.2/Table 3: "we use 800 samples, 10 refinement steps based on
@@ -152,7 +152,7 @@ MAX_TOTAL_STEPS=200
 # ──────────────────────────────────────────────────────────────────────
 # OUTPUT
 # ──────────────────────────────────────────────────────────────────────
-OUTPUT_DIR="./output_mpc_eval/${TASK}_${MODEL}_seed${SEED}"
+OUTPUT_DIR="./output_mpc_eval_031/${TASK}_${MODEL}_seed${SEED}"
 GIF_FPS=15
 
 # ══════════════════════════════════════════════════════════════════════
